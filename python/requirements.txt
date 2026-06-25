@@ -1,0 +1,51 @@
+# Install all:
+# pip install -r requirements.txt --break-system-packages
+#
+# Or install in order if you hit conflicts:
+# pip install pdfplumber camelot-py[cv] Pillow --break-system-packages
+# pip install pytesseract pdf2image opencv-python easyocr --break-system-packages
+# pip install defusedxml --break-system-packages
+
+# ── Core data processing ───────────────────────────────────────────────────────
+pandas>=2.0.0
+openpyxl>=3.1.0          # XLSX read/write
+duckdb>=0.10.0           # SQL on dataframes
+
+# ── Fuzzy matching ─────────────────────────────────────────────────────────────
+rapidfuzz>=3.0.0         # Fuzzy vendor name matching
+
+# ── CSV / data utilities ───────────────────────────────────────────────────────
+chardet>=5.0.0           # Encoding detection for CSV files
+
+# ── SECURITY: Safe XML parsing — prevents XXE / entity expansion attacks ───────
+# REQUIRED: replaces xml.etree.ElementTree for any user-uploaded XML
+# Install: pip install defusedxml --break-system-packages
+defusedxml>=0.7.1
+
+# ── OCR pipeline — Level 1: Digital PDF table extraction ──────────────────────
+pdfplumber>=0.10.0       # Fast table extraction from digital PDFs
+camelot-py[cv]>=0.11.0  # Better table extraction for complex layouts
+Pillow>=10.0.0           # Image processing (required by camelot and scanned OCR)
+
+# ── OCR pipeline — Level 2: Scanned PDF and image OCR ─────────────────────────
+pdf2image>=1.16.0        # Convert PDF pages to images for OCR
+# ALSO REQUIRES: poppler (system install)
+#   Windows: https://github.com/oschwartz10612/poppler-windows
+#   Already set up at F:\Poppler\poppler-0.89.0\bin ✓
+
+pytesseract>=0.3.10      # Python wrapper for Tesseract OCR engine
+# ALSO REQUIRES: Tesseract OCR (system install)
+#   Already set up at F:\Tesseract-OCR ✓
+
+opencv-python>=4.8.0     # Image preprocessing (deskew, denoise, threshold)
+
+easyocr>=1.7.0           # Fallback OCR — better for low-quality/non-standard fonts
+# NOTE: downloads ~400MB model on first use
+
+# ── Local speech-to-text ───────────────────────────────────────────────────────
+faster-whisper>=0.10.0   # Local Whisper STT — no API needed
+# Install: pip install faster-whisper
+
+# ── Optional — polars for faster data processing ──────────────────────────────
+# polars>=0.20.0         # Uncomment if you want faster DataFrame operations
+# pyarrow>=14.0.0        # Required by polars

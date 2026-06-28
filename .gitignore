@@ -1,8 +1,25 @@
-﻿node_modules/
+# Dependencies
+backend/node_modules/
+frontend/node_modules/
+
+# Environment files
+backend/.env
+frontend/.env
+
+# Runtime folders
+backend/temp/
+backend/uploads/
+outputs/
+
+# Logs
+*.log
+
+# Python
 __pycache__/
 *.pyc
-*.pyo
-.env
-.env.local
-uploads/*
-!uploads/.gitkeep
+.pytest_cache/
+.mypy_cache/
+
+# Coverage
+coverage/
+dist/

@@ -1,0 +1,320 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Inter:wght@300;400;500&display=swap');
+
+/* ── Page ────────────────────────────────────────────────────────────────────── */
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+  background: #f8fafc;
+  position: relative;
+  font-family: 'Inter', sans-serif;
+}
+
+.auth-page__bg {
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at 20% 20%, rgba(22,163,74,0.06) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 80%, rgba(22,163,74,0.04) 0%, transparent 50%);
+  pointer-events: none;
+}
+
+/* ── Card ────────────────────────────────────────────────────────────────────── */
+.auth-card {
+  width: 100%;
+  max-width: 420px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
+  padding: 40px 36px;
+  position: relative;
+  z-index: 1;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.06), 0 1px 4px rgba(0,0,0,0.04);
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-up { animation: fadeUp 0.4s ease both; }
+
+/* ── Brand ───────────────────────────────────────────────────────────────────── */
+.auth-card__brand {
+  display: block;
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: #0f172a;
+  text-decoration: none;
+  margin-bottom: 28px;
+}
+.auth-card__dot { color: #16a34a; }
+
+/* ── Headings ────────────────────────────────────────────────────────────────── */
+.auth-card__title {
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  color: #0f172a;
+  margin-bottom: 6px;
+}
+.auth-card__sub {
+  font-size: 14px;
+  color: #64748b;
+  margin-bottom: 28px;
+  line-height: 1.5;
+}
+
+/* ── Error ───────────────────────────────────────────────────────────────────── */
+.auth-card__error {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #dc2626;
+  font-size: 13px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  margin-bottom: 20px;
+  line-height: 1.5;
+}
+
+/* ── Form ────────────────────────────────────────────────────────────────────── */
+.auth-form { display: flex; flex-direction: column; gap: 16px; }
+
+.auth-form__group { display: flex; flex-direction: column; gap: 6px; }
+
+.auth-form__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #374151;
+  font-family: 'Plus Jakarta Sans', sans-serif;
+}
+
+.auth-form__label-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.auth-form__forgot {
+  font-size: 12px;
+  color: #16a34a;
+  font-weight: 600;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: 'Inter', sans-serif;
+  padding: 0;
+}
+.auth-form__forgot:hover { text-decoration: underline; }
+
+.auth-input {
+  width: 100%;
+  background: #f8fafc;
+  border: 1.5px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 11px 14px;
+  color: #0f172a;
+  font-family: 'Inter', sans-serif;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s, background 0.2s;
+}
+.auth-input:focus { border-color: #16a34a; background: #fff; }
+.auth-input::placeholder { color: #94a3b8; }
+.auth-input:disabled { opacity: 0.6; }
+
+/* ── Primary button ──────────────────────────────────────────────────────────── */
+.auth-btn-primary {
+  width: 100%;
+  background: #16a34a;
+  color: #fff;
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  font-weight: 700;
+  font-size: 15px;
+  padding: 13px;
+  border-radius: 12px;
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.15s, box-shadow 0.15s;
+  margin-top: 4px;
+}
+.auth-btn-primary:hover {
+  background: #15803d;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(22,163,74,0.25);
+}
+.auth-btn-primary:disabled { opacity: 0.6; pointer-events: none; }
+
+/* ── Divider ─────────────────────────────────────────────────────────────────── */
+.auth-card__divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 20px 0;
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 500;
+}
+.auth-card__divider::before,
+.auth-card__divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: #f1f5f9;
+}
+
+/* ── Google button ───────────────────────────────────────────────────────────── */
+.auth-card__google {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: #fff;
+  border: 1.5px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 11px;
+  color: #374151;
+  font-size: 14px;
+  font-weight: 600;
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  margin-bottom: 20px;
+}
+.auth-card__google:hover {
+  border-color: #cbd5e1;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+
+/* ── Footer text ─────────────────────────────────────────────────────────────── */
+.auth-card__terms {
+  font-size: 12px;
+  color: #94a3b8;
+  text-align: center;
+  margin-bottom: 14px;
+  line-height: 1.6;
+}
+.auth-card__terms a { color: #475569; text-decoration: underline; text-underline-offset: 2px; }
+
+.auth-card__switch {
+  font-size: 13px;
+  color: #64748b;
+  text-align: center;
+}
+.auth-card__switch-link {
+  color: #16a34a;
+  font-weight: 600;
+  text-decoration: none;
+}
+.auth-card__switch-link:hover { text-decoration: underline; }
+
+.auth-link {
+  background: none;
+  border: none;
+  color: #16a34a;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: inherit;
+  font-family: inherit;
+  padding: 0;
+  text-decoration: underline;
+}
+
+/* ── Forgot password modal ───────────────────────────────────────────────────── */
+.auth-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15,23,42,0.4);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+  padding: 20px;
+  animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+.auth-modal {
+  background: #fff;
+  border-radius: 20px;
+  padding: 40px 36px;
+  width: 100%;
+  max-width: 400px;
+  position: relative;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+  animation: fadeUp 0.25s ease;
+}
+
+.auth-modal__close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: #f1f5f9;
+  border: none;
+  border-radius: 8px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 13px;
+  color: #64748b;
+  transition: background 0.15s;
+}
+.auth-modal__close:hover { background: #e2e8f0; }
+
+.auth-modal__icon {
+  font-size: 32px;
+  margin-bottom: 16px;
+  text-align: center;
+}
+
+.auth-modal__title {
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  color: #0f172a;
+  margin-bottom: 8px;
+  text-align: center;
+}
+
+.auth-modal__sub {
+  font-size: 14px;
+  color: #64748b;
+  margin-bottom: 24px;
+  text-align: center;
+  line-height: 1.6;
+}
+
+.auth-modal__hint {
+  font-size: 13px;
+  color: #94a3b8;
+  text-align: center;
+  margin-bottom: 20px;
+  line-height: 1.6;
+}
+
+/* ── Success state ───────────────────────────────────────────────────────────── */
+.auth-modal__success { text-align: center; }
+.auth-modal__success-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: #f0fdf4;
+  border: 2px solid #bbf7d0;
+  color: #16a34a;
+  font-size: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 20px;
+}

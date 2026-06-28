@@ -1,0 +1,441 @@
+/**
+ * frontend/src/components/dashboard/ProcurementWorkspace.css  — V2
+ *
+ * Extends existing styles with:
+ *   - Progress bar
+ *   - Format badges
+ *   - Schema warning
+ *   - ZIP hint
+ *   - Analyze actions
+ */
+
+.procurement-workspace {
+  width: 100%;
+}
+
+/* ── Upload header ─────────────────────────────────────────────────────────── */
+
+.proc-upload-header {
+  margin-bottom: 24px;
+}
+
+.proc-upload-title {
+  font-family: var(--font-head);
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.proc-upload-sub {
+  font-size: 14px;
+  color: var(--text2);
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+
+.proc-upload-formats {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.proc-format-badge {
+  font-family: var(--font-head);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 4px 10px;
+  border-radius: 100px;
+  background: rgba(127,255,110,0.08);
+  border: 1px solid rgba(127,255,110,0.2);
+  color: var(--accent);
+}
+
+/* ── Progress bar ─────────────────────────────────────────────────────────── */
+
+.proc-progress-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: -8px 0 16px;
+}
+
+.proc-progress-bar {
+  flex: 1;
+  height: 4px;
+  background: var(--border);
+  border-radius: 100px;
+  overflow: hidden;
+}
+
+.proc-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 100px;
+  transition: width 0.4s ease;
+  /* FIX [MEDIUM]: Promote to its own compositor layer — prevents layout thrashing
+     during rapid progress updates from the polling loop */
+  will-change: width;
+}
+
+.proc-progress-label {
+  font-size: 12px;
+  font-family: var(--font-head);
+  font-weight: 600;
+  color: var(--accent);
+  min-width: 36px;
+  text-align: right;
+}
+
+/* ── Schema warning ─────────────────────────────────────────────────────────── */
+
+.proc-schema-warning {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  background: rgba(255,179,71,0.07);
+  border: 1px solid rgba(255,179,71,0.25);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+
+.proc-schema-warning__icon {
+  font-size: 16px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.proc-schema-warning__title {
+  font-family: var(--font-head);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--warning);
+  margin-bottom: 4px;
+}
+
+.proc-schema-warning__detail {
+  font-size: 13px;
+  color: var(--text2);
+  line-height: 1.5;
+}
+
+/* ── ZIP hint ─────────────────────────────────────────────────────────────── */
+
+.proc-zip-hint {
+  font-size: 14px;
+  color: var(--text2);
+  text-align: center;
+  padding: 20px;
+  background: var(--bg2);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-lg);
+  margin-top: 16px;
+}
+
+/* ── Analyze actions ──────────────────────────────────────────────────────── */
+
+.proc-analyze-actions {
+  margin-top: 24px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* ── Existing styles (preserved from V1) ──────────────────────────────────── */
+
+.proc-info-card {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  margin-bottom: 24px;
+}
+
+.proc-info-card__icon {
+  font-size: 24px;
+  flex-shrink: 0;
+}
+
+.proc-info-card__title {
+  font-family: var(--font-head);
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.proc-info-card__desc {
+  font-size: 13px;
+  color: var(--text2);
+  line-height: 1.6;
+}
+
+.proc-approvals-header {
+  margin-bottom: 16px;
+}
+
+.proc-approvals-title {
+  font-family: var(--font-head);
+  font-size: 18px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+.proc-whatsapp-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.proc-phone-input {
+  max-width: 260px;
+}
+
+.proc-wa-btn {
+  font-size: 13px;
+  padding: 10px 16px;
+}
+
+.proc-wa-notice {
+  font-size: 12px;
+  color: var(--accent);
+  margin-bottom: 16px;
+  padding: 8px 12px;
+  background: rgba(127,255,110,0.08);
+  border-radius: var(--radius);
+  border: 1px solid rgba(127,255,110,0.2);
+}
+
+.proc-ready {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: rgba(127,255,110,0.06);
+  border: 1px solid rgba(127,255,110,0.25);
+  border-radius: var(--radius-lg);
+  padding: 16px 20px;
+  font-size: 14px;
+  color: var(--text);
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+
+.proc-ready__icon {
+  font-size: 18px;
+  color: var(--accent);
+}
+
+.proc-execute-btn {
+  margin-left: auto;
+}
+
+/* OCR format badge variant */
+.proc-format-badge--ocr {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border-color: #bfdbfe;
+}
+
+/* OCR confidence badge */
+.proc-ocr-badge {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 14px 18px;
+  border-radius: 12px;
+  margin-bottom: 18px;
+  border: 1px solid;
+}
+
+.proc-ocr-badge--high {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+}
+.proc-ocr-badge--medium {
+  background: #fefce8;
+  border-color: #fde68a;
+}
+.proc-ocr-badge--low {
+  background: #fff7ed;
+  border-color: #fed7aa;
+}
+.proc-ocr-badge--very_low {
+  background: #fef2f2;
+  border-color: #fecaca;
+}
+
+.proc-ocr-badge__icon {
+  font-size: 20px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.proc-ocr-badge__content {
+  flex: 1;
+}
+
+.proc-ocr-badge__title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #111;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 3px;
+}
+
+.proc-ocr-badge__pct {
+  font-size: 12px;
+  font-weight: 600;
+  background: rgba(0,0,0,0.07);
+  padding: 2px 8px;
+  border-radius: 10px;
+  color: #444;
+}
+
+.proc-ocr-badge__method {
+  font-size: 12px;
+  color: #666;
+  margin-bottom: 8px;
+}
+
+.proc-ocr-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.proc-ocr-field {
+  font-size: 12px;
+  background: rgba(0,0,0,0.06);
+  padding: 3px 9px;
+  border-radius: 6px;
+  color: #333;
+  font-weight: 500;
+}
+
+/* ── ADD THESE TO THE BOTTOM OF ProcurementWorkspace.css ── */
+
+/* ── Phase bar navigation arrows ──────────────────────────────────────────── */
+.phase-bar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  position: relative;
+}
+
+.phase-nav-btn {
+  background: none;
+  border: 1px solid var(--border2);
+  border-radius: var(--radius);
+  color: var(--text2);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 10px;
+  transition: all 0.15s;
+  flex-shrink: 0;
+  margin: 0 4px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+}
+
+.phase-nav-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(127, 255, 110, 0.06);
+}
+
+.phase-nav-btn:disabled {
+  opacity: 0.25;
+  cursor: not-allowed;
+}
+
+/* Checkmark on completed phase labels */
+.phase-bar__check {
+  color: var(--accent);
+  font-size: 11px;
+  margin-right: 2px;
+}
+
+/* Clickable completed phases */
+.phase-bar__item.done {
+  cursor: pointer;
+  opacity: 0.75;
+  transition: opacity 0.15s;
+}
+.phase-bar__item.done:hover {
+  opacity: 1;
+  color: var(--accent);
+}
+
+/* ── Sticky Jump-to-Execute bar ────────────────────────────────────────────── */
+.proc-jump-bar {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 200;
+
+  display: flex;
+  align-items: center;
+  gap: 12px;
+
+  background: var(--bg2);
+  border: 1px solid var(--border2);
+  border-radius: 100px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+  padding: 8px 16px 8px 12px;
+
+  min-width: 320px;
+  max-width: 480px;
+}
+
+.proc-jump-bar__progress {
+  flex: 1;
+  height: 6px;
+  background: var(--border);
+  border-radius: 100px;
+  overflow: hidden;
+  min-width: 80px;
+}
+
+.proc-jump-bar__fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 100px;
+  transition: width 0.4s ease;
+}
+
+.proc-jump-bar__label {
+  font-size: 12px;
+  color: var(--text2);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.proc-jump-bar__btn {
+  background: var(--accent);
+  border: none;
+  border-radius: 100px;
+  color: #0a0a0a;
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 13px;
+  font-weight: 700;
+  padding: 7px 16px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+
+.proc-jump-bar__btn:hover {
+  opacity: 0.85;
+}

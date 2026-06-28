@@ -1,0 +1,42 @@
+.loader {
+  display: inline-block;
+  width: 32px;
+  height: 32px;
+  border: 3px solid rgba(127, 255, 110, 0.15);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+}
+
+.loader--inline {
+  width: 16px;
+  height: 16px;
+  border-width: 2px;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+
+.loader__wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 48px;
+}
+
+.loader__wrap--fullscreen {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  z-index: 999;
+}
+
+.loader__message {
+  font-size: 14px;
+  color: var(--text2);
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

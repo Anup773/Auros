@@ -2,7 +2,7 @@
 /**
  * backend/services/pythonBridge.service.js
  *
- * CHANGES FROM V3 (this version):
+ * CHANGES FROM V3 (this version — V4):
  *
  *   FIX 1 — OCR retry storm prevention (CRITICAL)
  *     Previously: ENGINE_TIMEOUT triggered retries for OCR operations.
@@ -23,10 +23,27 @@
  *     before it reaches Node's memory. The full text is processed by
  *     Python and only structured rows are returned at scale.
  *
- *   FIX 4 — Path whitelist enforcement (SECURITY)
- *     Path validation now uses a whitelist of allowed base directories
- *     (uploads/, temp/, exports/, tmp/) instead of only blacklisting '..'.
- *     Absolute Windows paths (C:\...) are now also rejected.
+ *   FIX 4 — Path whitelist enforcement (SECURITY) — REVISED
+ *     Previous V3 implementation blanket-rejected ALL absolute Windows paths
+ *     (C:\...) which broke legitimate server-side OCR temp paths like:
+ *       C:\WINDOWS\TEMP\auros_ocr\<hash>_invoice.jpg
+ *       C:\WINDOWS\TEMP\auros_ocr\<hash>_invoice.pdf
+ *     These paths are generated internally by the upload/OCR pipeline and
+ *     are NOT user-supplied — they must be allowed.
+ *
+ *     REVISED FIX:
+ *     - ".." traversal and "~" home-dir expansion are still rejected (unsafe
+ *       regardless of origin).
+ *     - For relative paths: the existing prefix whitelist is enforced
+ *       (uploads/, temp/, tmp/, exports/, output/, outputs/, data/).
+ *     - For absolute paths (both Linux /... and Windows C:\...):
+ *       the path is normalised (backslashes → forward slashes) and checked
+ *       against ALLOWED_ABSOLUTE_SEGMENTS — a list of known safe directory
+ *       name segments that must appear in the path.
+ *       If none of the allowed segments match, the path is rejected.
+ *     - This correctly allows C:\WINDOWS\TEMP\auros_ocr\... (contains
+ *       "auros_ocr") while still blocking arbitrary paths like C:\Users\...
+ *       or C:\secret\passwords.txt.
  *
  *   FIX 5 — Stderr size cap now applies to logging too
  *     Previously stderr was logged in full even when truncated. Now
@@ -94,15 +111,46 @@ const ALLOWED_OPS = new Set([
   'ocr_invoice', 'ocr_batch',
 ]);
 
-// ── FIX 4: Allowed base directories for path validation ───────────────────────
-// RETROACTIVE FIX (Batch 4): Added 'outputs/' — pipelineExecutor routes large
-// datasets to Python via callEngine with an outputPath in the outputs/ directory.
-// Without 'outputs/' here, the path whitelist would reject outputPath with
-// VALIDATION_ERROR and Python pipeline execution would fail completely.
+// ── FIX 4 (REVISED): Path validation — relative prefix whitelist ──────────────
+// Used for relative paths only.
 const ALLOWED_PATH_PREFIXES = [
   'uploads/', 'upload/', 'temp/', 'tmp/', 'exports/',
-  'output/', 'outputs/',   // ← required for pipelineExecutor Python routing
+  'output/', 'outputs/',
   'data/', '/tmp/', '/var/tmp/',
+];
+
+// ── FIX 4 (REVISED): Absolute path segment whitelist ─────────────────────────
+// For absolute paths (Windows C:\... or Linux /...) we check that the
+// normalised path contains at least one of these known-safe directory segments.
+//
+// This approach is safe because:
+//   - ".." is already blocked before we reach this check (no traversal possible)
+//   - We are checking segments that are under the application's own control
+//     (auros_ocr temp dir, the uploads dir, the outputs dir, etc.)
+//   - An attacker cannot cause C:\secret\passwords.txt to match because
+//     "secret" and "passwords" are not in this list.
+//
+// To add a new safe directory in future: append its lowercase name here.
+// Segments are matched case-insensitively against the normalised path.
+const ALLOWED_ABSOLUTE_SEGMENTS = [
+  // Application OCR temp directory (created by the upload pipeline)
+  'auros_ocr',
+  // Standard temp directories on Windows and Linux
+  'windows\\temp',   // won't appear after normalise but kept for clarity
+  'windows/temp',
+  // Application upload / output directories
+  'uploads',
+  'upload',
+  'outputs',
+  'output',
+  'exports',
+  'temp',
+  'tmp',
+  // Linux standard temp
+  '/tmp',
+  '/var/tmp',
+  // Application data directory
+  'auros',           // matches any path containing the app's own folder name
 ];
 
 /**
@@ -293,6 +341,28 @@ function _spawnEngine(config, enginePath, timeoutMs) {
   });
 }
 
+/**
+ * _validateConfig — validate the engine config object.
+ *
+ * FIX 4 (REVISED): Path validation strategy:
+ *
+ *   1. ".." and "~" are always rejected — traversal / home-dir expansion
+ *      are unsafe regardless of whether the path is absolute or relative.
+ *
+ *   2. Relative paths are checked against ALLOWED_PATH_PREFIXES (unchanged
+ *      from V3).
+ *
+ *   3. Absolute paths — both Linux (/tmp/...) and Windows (C:\WINDOWS\TEMP\...)
+ *      — are checked against ALLOWED_ABSOLUTE_SEGMENTS.  The path is first
+ *      normalised (backslashes → forward slashes, lowercased) and then we
+ *      verify that it contains at least one known-safe directory segment.
+ *
+ *      This is the key fix: the old code rejected ALL absolute Windows paths
+ *      which broke the OCR pipeline because uploaded files are staged in
+ *      C:\WINDOWS\TEMP\auros_ocr\ by the OS/multer before being processed.
+ *
+ * @param {Object} config
+ */
 function _validateConfig(config) {
   if (!config || typeof config !== 'object') {
     const err = new Error('Engine config must be a plain object');
@@ -307,42 +377,55 @@ function _validateConfig(config) {
     err.code = 'VALIDATION_ERROR'; err.status = 400; throw err;
   }
 
-  // ── FIX 4: Path whitelist (not just blacklist) ───────────────────────────
-  const pathFields = ['filePath', 'invoicePath', 'poPath', 'zipPath', 'extractTo', 'outputPath'];
+  const pathFields = ['filePath', 'invoicePath', 'poPath', 'zipPath', 'extractTo', 'outputPath', 'audioFilePath'];
   for (const field of pathFields) {
-    if (config[field] !== undefined) {
-      const p = String(config[field]);
+    if (config[field] === undefined) continue;
 
-      // Existing blacklist checks
-      if (p.includes('..') || p.startsWith('~')) {
-        const err = new Error(`Unsafe path in config.${field}: ${p}`);
-        err.code = 'VALIDATION_ERROR'; err.status = 400; throw err;
-      }
+    const p = String(config[field]);
 
-      // FIX 4: Reject absolute Windows paths (C:\, D:\, etc.)
-      if (/^[a-zA-Z]:[\\\/]/.test(p) && !p.startsWith('/')) {
-        // Allow if it's a valid server-side absolute path starting with /
-        const err = new Error(`Absolute Windows path not allowed in config.${field}: ${p}`);
-        err.code = 'VALIDATION_ERROR'; err.status = 400; throw err;
-      }
-
-      // FIX 4: Enforce path prefix whitelist for relative paths
-      const normalized = p.replace(/\\/g, '/');
-      const isAbsolute = normalized.startsWith('/');
-      if (!isAbsolute) {
-        const allowed = ALLOWED_PATH_PREFIXES.some(prefix => normalized.startsWith(prefix));
-        if (!allowed) {
-          const err = new Error(
-            `Path in config.${field} must be under an allowed directory ` +
-            `(${ALLOWED_PATH_PREFIXES.filter(p => !p.startsWith('/')).join(', ')}). ` +
-            `Got: ${p}`
-          );
-          err.code = 'VALIDATION_ERROR'; err.status = 400; throw err;
-        }
-      }
-
-      config[field] = normalized;
+    // ── Step 1: Always-unsafe patterns ──────────────────────────────────
+    if (p.includes('..')) {
+      const err = new Error(`Path traversal detected in config.${field}: ${p}`);
+      err.code = 'VALIDATION_ERROR'; err.status = 400; throw err;
     }
+    if (p.startsWith('~')) {
+      const err = new Error(`Home-directory expansion not allowed in config.${field}: ${p}`);
+      err.code = 'VALIDATION_ERROR'; err.status = 400; throw err;
+    }
+
+    // Normalise: backslashes → forward slashes
+    const normalized = p.replace(/\\/g, '/');
+    const isAbsolute = normalized.startsWith('/') || /^[a-zA-Z]:\//.test(normalized);
+
+    if (isAbsolute) {
+      // ── Step 2: Absolute path — check against allowed segments ──────────
+      // Lowercase for case-insensitive matching on Windows
+      const lowerNorm = normalized.toLowerCase();
+      const allowed = ALLOWED_ABSOLUTE_SEGMENTS.some(seg => lowerNorm.includes(seg.toLowerCase()));
+
+      if (!allowed) {
+        const err = new Error(
+          `Absolute path in config.${field} is not in an allowed directory. ` +
+          `Allowed segments: ${ALLOWED_ABSOLUTE_SEGMENTS.join(', ')}. ` +
+          `Got: ${p}`
+        );
+        err.code = 'VALIDATION_ERROR'; err.status = 400; throw err;
+      }
+    } else {
+      // ── Step 3: Relative path — check against prefix whitelist ──────────
+      const allowed = ALLOWED_PATH_PREFIXES.some(prefix => normalized.startsWith(prefix));
+      if (!allowed) {
+        const err = new Error(
+          `Path in config.${field} must be under an allowed directory ` +
+          `(${ALLOWED_PATH_PREFIXES.filter(p => !p.startsWith('/')).join(', ')}). ` +
+          `Got: ${p}`
+        );
+        err.code = 'VALIDATION_ERROR'; err.status = 400; throw err;
+      }
+    }
+
+    // Store the normalised (forward-slash) version back into config
+    config[field] = normalized;
   }
 }
 

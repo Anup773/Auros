@@ -1,29 +1,30 @@
 'use strict';
+
 /**
  * backend/controllers/procurement.controller.js
  *
  * CHANGES FROM V2 (addressing audit findings):
  *
- *   [AUDIT #4 - MEDIUM] BULK APPROVE CAP enforced at controller level.
- *     approvalIds.length > MAX_BULK_APPROVALS now rejected with 400 before
- *     reaching the engine. Comment said 500 but controller never checked it.
+ * [AUDIT #4 - MEDIUM] BULK APPROVE CAP enforced at controller level.
+ * approvalIds.length > MAX_BULK_APPROVALS now rejected with 400 before
+ * reaching the engine. Comment said 500 but controller never checked it.
  *
- *   [AUDIT #5 - MEDIUM] DATASET OWNERSHIP VALIDATION added.
- *     _resolveDatasetPath now verifies the entry belongs to req.user.id before
- *     returning the path. Cross-user dataset access returns 404 — client learns
- *     nothing about whether the ID exists for another user.
+ * [AUDIT #5 - MEDIUM] DATASET OWNERSHIP VALIDATION added.
+ * _resolveDatasetPath now verifies the entry belongs to req.user.id before
+ * returning the path. Cross-user dataset access returns 404 — client learns
+ * nothing about whether the ID exists for another user.
  *
- *   [AUDIT #2 - HIGH] OWNERSHIP RACE CONDITION MITIGATION.
- *     _assertJobOwner is kept at controller level for early rejection, but userId
- *     is now forwarded into every engine mutating call (approveItem, rejectItem,
- *     bulkApprove, lockApprovalItem) so the engine can re-validate atomically.
- *     Engine MUST enforce this internally to close the race window.
+ * [AUDIT #2 - HIGH] OWNERSHIP RACE CONDITION MITIGATION.
+ * _assertJobOwner is kept at controller level for early rejection, but userId
+ * is now forwarded into every engine mutating call (approveItem, rejectItem,
+ * bulkApprove, lockApprovalItem) so the engine can re-validate atomically.
+ * Engine MUST enforce this internally to close the race window.
  *
- *   NOTE — items that require infrastructure changes (not fixable in this layer):
- *     [AUDIT #1]  In-memory job storage  → engine must use PostgreSQL / Redis.
- *     [AUDIT #3]  In-memory locks        → engine must use Redis Redlock.
- *     [AUDIT #17] Distributed persistence → entire backend concern.
- *     These are documented here but cannot be solved in the controller alone.
+ * NOTE — items that require infrastructure changes (not fixable in this layer):
+ * [AUDIT #1] In-memory job storage → engine must use PostgreSQL / Redis.
+ * [AUDIT #3] In-memory locks → engine must use Redis Redlock.
+ * [AUDIT #17] Distributed persistence → entire backend concern.
+ * These are documented here but cannot be solved in the controller alone.
  */
 
 const path   = require('path');
@@ -33,8 +34,7 @@ const audit  = require('../audit/auditLogger.service');
 // [AUDIT #4] Controller-level cap — mirrors engine constant, enforced here first.
 const MAX_BULK_APPROVALS = 500;
 
-// ── List jobs ─────────────────────────────────────────────────────────────────
-
+// ── List jobs ────────────────────────────────────────────────────────────────
 exports.listJobs = (req, res, next) => {
   try {
     const jobs = engine.listJobs(req.user.id);
@@ -44,8 +44,7 @@ exports.listJobs = (req, res, next) => {
   }
 };
 
-// ── Start reconciliation (ASYNC) ──────────────────────────────────────────────
-
+// ── Start reconciliation (ASYNC) ─────────────────────────────────────────────
 exports.startReconciliation = async (req, res, next) => {
   try {
     const { invoiceDatasetId, poDatasetId } = req.body;
@@ -74,7 +73,9 @@ exports.startReconciliation = async (req, res, next) => {
     // If BullMQ/Redis available: queued=true, bullJobId provided for polling.
     // If not available: queued=false, synchronous (may be slow on large files).
     const { jobId, bullJobId, queued } = await engine.startReconciliation(
-      invoicePath, poPath, req.user.id
+      invoicePath,
+      poPath,
+      req.user.id
     );
 
     res.status(202).json({
@@ -83,17 +84,15 @@ exports.startReconciliation = async (req, res, next) => {
       queued,
       status    : 'processing',
       message   : queued
-        ? 'Reconciliation queued. Poll /api/queue/status/' + bullJobId + ' for progress.'
-        : 'Reconciliation started. Poll /api/procurement/' + jobId + ' for status.',
+        ? `Reconciliation queued. Poll /api/queue/status/${bullJobId} for progress.`
+        : `Reconciliation started. Poll /api/procurement/${jobId} for status.`,
     });
-
   } catch (err) {
     next(err);
   }
 };
 
-// ── Get job ───────────────────────────────────────────────────────────────────
-
+// ── Get job ──────────────────────────────────────────────────────────────────
 exports.getJob = (req, res, next) => {
   try {
     const job = engine.getJob(req.params.jobId);
@@ -114,7 +113,6 @@ exports.getJob = (req, res, next) => {
 // Prevents another reviewer grabbing the same item simultaneously.
 // NOTE [AUDIT #3]: locks must be backed by Redis Redlock in the engine,
 // not an in-memory Map, for this to survive pod restarts and horizontal scaling.
-
 exports.lockItem = (req, res, next) => {
   try {
     const { jobId, approvalId } = req.params;
@@ -122,23 +120,20 @@ exports.lockItem = (req, res, next) => {
 
     // [AUDIT #2] userId forwarded — engine must re-validate atomically.
     const result = engine.lockApprovalItem(jobId, approvalId, req.user.id);
-
     if (!result.acquired) {
       return res.status(409).json({
-        error   : result.reason,
-        code    : 'LOCK_CONFLICT',
-        lockedBy: result.lockedBy,
+        error    : result.reason,
+        code     : 'LOCK_CONFLICT',
+        lockedBy : result.lockedBy,
       });
     }
-
     res.json({ locked: true, approvalId });
   } catch (err) {
     next(err);
   }
 };
 
-// ── Release lock (user closed review panel without deciding) ──────────────────
-
+// ── Release lock (user closed review panel without deciding) ─────────────────
 exports.releaseLock = (req, res, next) => {
   try {
     const { jobId, approvalId } = req.params;
@@ -150,8 +145,31 @@ exports.releaseLock = (req, res, next) => {
   }
 };
 
-// ── Approve item ──────────────────────────────────────────────────────────────
+// ── Renew lock (extend TTL while user is still actively reviewing) ────────────
+// Call periodically from the review UI (e.g. every 30 s) to prevent the lock
+// from expiring while the reviewer is still working on the item.
+// NOTE [AUDIT #3]: effective only once engine.renewLock() is backed by
+// Redis Redlock — in-memory locks don't expire so renewal is a no-op there.
+exports.renewLock = (req, res, next) => {
+  try {
+    const { jobId, approvalId } = req.params;
+    _assertJobOwner(jobId, req);
 
+    // [AUDIT #2] userId forwarded — engine must verify the caller still holds
+    // the lock before extending it (prevents a different user from renewing).
+    const result = engine.renewLock(jobId, approvalId, req.user.id);
+
+    res.json({
+      success    : true,
+      approvalId,
+      ...result,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ── Approve item ─────────────────────────────────────────────────────────────
 exports.approveItem = (req, res, next) => {
   try {
     const { jobId, approvalId } = req.params;
@@ -174,8 +192,7 @@ exports.approveItem = (req, res, next) => {
   }
 };
 
-// ── Reject item ───────────────────────────────────────────────────────────────
-
+// ── Reject item ──────────────────────────────────────────────────────────────
 exports.rejectItem = (req, res, next) => {
   try {
     const { jobId, approvalId } = req.params;
@@ -193,13 +210,12 @@ exports.rejectItem = (req, res, next) => {
   }
 };
 
-// ── Bulk approve ──────────────────────────────────────────────────────────────
+// ── Bulk approve ─────────────────────────────────────────────────────────────
 // Apply same response to multiple approval items at once.
 // [AUDIT #4] Hard-capped at MAX_BULK_APPROVALS (500) per call — enforced here.
-
 exports.bulkApprove = (req, res, next) => {
   try {
-    const { jobId }                               = req.params;
+    const { jobId } = req.params;
     const { approvalIds, response, respondedVia } = req.body;
 
     if (!approvalIds || !Array.isArray(approvalIds)) {
@@ -212,10 +228,10 @@ exports.bulkApprove = (req, res, next) => {
     // [AUDIT #4] Enforce cap before any engine work — prevents DoS via huge arrays.
     if (approvalIds.length > MAX_BULK_APPROVALS) {
       return res.status(400).json({
-        error   : `approvalIds exceeds maximum of ${MAX_BULK_APPROVALS} items per call`,
-        code    : 'BULK_LIMIT_EXCEEDED',
-        limit   : MAX_BULK_APPROVALS,
-        received: approvalIds.length,
+        error    : `approvalIds exceeds maximum of ${MAX_BULK_APPROVALS} items per call`,
+        code     : 'BULK_LIMIT_EXCEEDED',
+        limit    : MAX_BULK_APPROVALS,
+        received : approvalIds.length,
       });
     }
 
@@ -223,28 +239,30 @@ exports.bulkApprove = (req, res, next) => {
 
     // [AUDIT #2] userId forwarded — engine must re-validate ownership atomically.
     const result = engine.bulkApprove(
-      jobId, approvalIds, response, respondedVia || 'dashboard', req.user.id
+      jobId,
+      approvalIds,
+      response,
+      respondedVia || 'dashboard',
+      req.user.id
     );
 
     res.json({
-      success  : true,
-      applied  : result.applied,
-      skipped  : result.skipped,
-      conflicts: result.conflicts,
-      message  : `Applied to ${result.applied} items. ${result.conflicts} conflicts skipped.`,
+      success   : true,
+      applied   : result.applied,
+      skipped   : result.skipped,
+      conflicts : result.conflicts,
+      message   : `Applied to ${result.applied} items. ${result.conflicts} conflicts skipped.`,
     });
   } catch (err) {
     next(err);
   }
 };
 
-// ── Execute ───────────────────────────────────────────────────────────────────
-
+// ── Execute ──────────────────────────────────────────────────────────────────
 exports.executeReconciliation = async (req, res, next) => {
   try {
     const { jobId } = req.params;
     _assertJobOwner(jobId, req);
-
     const result = await engine.executeReconciliation(jobId);
     res.json({ success: true, ...result });
   } catch (err) {
@@ -252,8 +270,7 @@ exports.executeReconciliation = async (req, res, next) => {
   }
 };
 
-// ── Audit trail ───────────────────────────────────────────────────────────────
-
+// ── Audit trail ──────────────────────────────────────────────────────────────
 exports.getAuditTrail = (req, res, next) => {
   try {
     const { jobId } = req.params;
@@ -277,8 +294,7 @@ exports.getAuditTrail = (req, res, next) => {
   }
 };
 
-// ── Schema endpoint ───────────────────────────────────────────────────────────
-
+// ── Schema endpoint ──────────────────────────────────────────────────────────
 exports.getSchema = async (req, res, next) => {
   try {
     const { jobId } = req.params;
@@ -291,16 +307,15 @@ exports.getSchema = async (req, res, next) => {
     const { schema, sampleRows } = await detectSchema(job.invoiceFilePath);
 
     res.json({
-      schema    : formatSchemaForUI(schema),
-      sampleRows: sampleRows.slice(0, 5),
+      schema     : formatSchemaForUI(schema),
+      sampleRows : sampleRows.slice(0, 5),
     });
   } catch (err) {
     next(err);
   }
 };
 
-// ── Download output ───────────────────────────────────────────────────────────
-
+// ── Download output ──────────────────────────────────────────────────────────
 exports.downloadOutput = (req, res, next) => {
   try {
     const { jobId } = req.params;
@@ -317,8 +332,7 @@ exports.downloadOutput = (req, res, next) => {
   }
 };
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
+// ── Helpers ──────────────────────────────────────────────────────────────────
 function _assertJobOwner(jobId, req) {
   const job = engine.getJob(jobId);
   if (!job) {
@@ -340,15 +354,14 @@ function _assertJobOwner(jobId, req) {
  * OR if it belongs to a different user. Callers treat null as 404 — the client
  * learns nothing about whether the ID exists for another user (no info leak).
  *
- * @param {string} datasetId
- * @param {import('express').Request} req
+ * @param {string}                        datasetId
+ * @param {import('express').Request}     req
  * @returns {string|null}
  */
 function _resolveDatasetPath(datasetId, req) {
   try {
     const { datasetStore } = require('./data.controller');
     const entry = datasetStore.get(datasetId);
-
     if (!entry) return null;
 
     // [AUDIT #5] Reject cross-user access — treat as not-found to avoid

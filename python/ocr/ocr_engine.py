@@ -1,51 +1,33 @@
-
 """
 backend/python/ocr/ocr_engine.py
 
-Main OCR pipeline entry point.
-Routes documents through 3 levels:
-  Level 1 — pdfplumber / camelot   (digital PDFs, fast, free)
-  Level 2 — pytesseract + OpenCV   (scanned PDFs, images)
-  Level 3 — Gemini Vision fallback (only if confidence too low, ~2-5% of docs)
+CHANGES FROM V2 (this version — V3):
 
-CHANGES FROM V1 (this version):
+  CRITICAL FIX — WINDOWS MULTIPROCESSING HANG
+    Previous: _run_with_timeout() tried multiprocessing.Process first.
+    On Windows, multiprocessing requires the 'spawn' start method and the
+    if __name__ == '__main__' guard. When called from an imported module
+    (which is always the case here — data_engine.py imports ocr_engine.py),
+    each spawned process re-imports the module and tries to spawn another
+    process, causing an infinite spawn loop that never resolves.
+    Result: OCR hung for the full 320s timeout on EVERY image/PDF on Windows.
 
-  FIX 1 — Confidence is now a WEIGHTED AVERAGE, not multiplication (Bug #13 — CRITICAL)
-    Previous: confidence = score_confidence(parsed) * ocr_raw_confidence
-    Example: parser=0.80, ocr=0.55 → 0.44 → instant AI fallback even on
-    good extractions. This was the #1 cause of "OCR confidence below threshold".
-    Fix: confidence = parser_conf * 0.7 + ocr_conf * 0.3
-    This reflects that parser quality matters more than raw OCR word accuracy.
+    Fix: Detect the OS at module load time. On Windows, always use the
+    threading-based timeout (_run_with_timeout_thread). On Linux/Mac,
+    use multiprocessing as before (true kill on timeout).
 
-  FIX 2 — Parse FIRST, score AFTER (Bug #7)
-    Previous: Level 1 checked rows AND confidence >= 0.6 BEFORE parsing.
-    If raw rows existed but confidence was 0.58, OCR never reached the parser.
-    Fix: Always run parse_invoice_fields() on any non-empty result, THEN score.
+    This is why your JPG and PNG invoices — perfectly clear, readable images
+    that EasyOCR/pytesseract can process in 2-3 seconds — were timing out
+    after 320 seconds every single time.
 
-  FIX 3 — Always return partial data, never discard (Bug #14 — VERY HIGH)
-    Previous: On failure, returned { rows: [], rawText: '' }
-    User saw "0 records extracted" even when OCR got partial text.
-    Fix: Always return whatever was extracted (partial rows, raw text, fields).
-    This also means reconciliation can show the partial data and ask for review.
-
-  FIX 4 — Level 2 condition fixed: HAS_PDF2IMAGE only (Bug #12)
-    Previous: `if is_pdf and (HAS_PDF2IMAGE or HAS_CAMELOT)` — Camelot is a
-    table extractor, it has nothing to do with PDF→image conversion.
-    Fix: `if is_pdf and HAS_PDF2IMAGE`
-
-  FIX 5 — _text_to_pseudo_rows() creates semantic rows (Bug #8)
-    Previous: [{'raw_line': line, 'line_index': i}] — the invoice parser
-    couldn't find invoice_number/vendor_name/amount columns in 'raw_line'.
-    Fix: Each line is also scanned for key-value patterns and stored under
-    recognizable field names that the parser's column-scan logic can find.
-
-  FIX 6 — _run_with_timeout() now uses multiprocessing for true kill (Bug #11)
-    Previous: daemon thread — timeout returned None but thread kept running,
-    consuming CPU/RAM. Multiple uploads → dozens of zombie OCR threads.
-    Fix: Uses multiprocessing.Process which can be .terminate()d on timeout.
-    Falls back to threading if multiprocessing is unavailable.
-
-  MAX_OCR_PAGES, MAX_OCR_FILE_BYTES, per-level timeouts all preserved from V1.
+  All V2 fixes preserved exactly:
+    - FIX 1: Confidence weighted average (parser 70% + OCR 30%)
+    - FIX 2: Parse FIRST, score AFTER
+    - FIX 3: Always return partial data, never discard
+    - FIX 4: Level 2 condition: HAS_PDF2IMAGE only
+    - FIX 5: _text_to_pseudo_rows() semantic rows
+    - FIX 6: _run_with_timeout_thread fallback
+    - MAX_OCR_PAGES, MAX_OCR_FILE_BYTES, per-level timeouts
 """
 
 import os
@@ -57,6 +39,12 @@ import threading
 import multiprocessing
 warnings.filterwarnings("ignore")
 
+# ── WINDOWS FIX: detect platform at import time ───────────────────────────────
+# On Windows, multiprocessing.Process cannot be safely used from an imported
+# module due to the 'spawn' start method requirement. Always use threading on
+# Windows. On Linux/Mac, use multiprocessing for true process kill on timeout.
+_IS_WINDOWS = sys.platform.startswith('win')
+
 # ── Limits ────────────────────────────────────────────────────────────────────
 MAX_OCR_PAGES      = int(os.environ.get('MAX_OCR_PAGES',     '50'))
 MAX_OCR_FILE_BYTES = int(os.environ.get('MAX_OCR_FILE_MB',   '200')) * 1024 * 1024
@@ -64,7 +52,7 @@ OCR_PAGE_TIMEOUT   = int(os.environ.get('OCR_PAGE_TIMEOUT',  '60'))
 OCR_LEVEL1_TIMEOUT = int(os.environ.get('OCR_LEVEL1_TIMEOUT','120'))
 OCR_LEVEL2_TIMEOUT = int(os.environ.get('OCR_LEVEL2_TIMEOUT','180'))
 
-# FIX 1: Confidence blend weights
+# Confidence blend weights
 _PARSER_CONF_WEIGHT = 0.70
 _OCR_CONF_WEIGHT    = 0.30
 
@@ -112,6 +100,8 @@ try:
 except ImportError:
     HAS_EASYOCR = False
 
+import re
+
 from .pdf_table_extractor import extract_pdf_tables
 from .scanned_ocr         import ocr_scanned_document
 from .invoice_parser      import parse_invoice_fields
@@ -121,17 +111,6 @@ from .confidence          import score_confidence, should_use_ai_fallback, CONFI
 def process_document(file_path: str, config: dict) -> dict:
     """
     Main entry point. Routes document through the pipeline.
-
-    Returns:
-    {
-      "rows"           : [...],    # normalized rows for reconciliation engine
-      "rawText"        : str,      # extracted text (capped at 500 chars by caller)
-      "confidence"     : float,
-      "method"         : str,
-      "warnings"       : [...],
-      "needsAIFallback": bool,
-      "extractedFields": dict,
-    }
     """
     warnings_list = []
     ext           = os.path.splitext(file_path)[1].lower()
@@ -156,7 +135,6 @@ def process_document(file_path: str, config: dict) -> dict:
             f"Large file ({file_size / (1024*1024):.1f} MB) — OCR may take several minutes."
         )
 
-    # Accumulators for best partial result across levels
     best_rows    = []
     best_text    = ''
     best_fields  = {}
@@ -176,7 +154,6 @@ def process_document(file_path: str, config: dict) -> dict:
         elif isinstance(result, Exception):
             warnings_list.append(f"Level 1 failed: {result}")
         elif result.get('rows') or result.get('raw_text'):
-            # FIX 2: Parse FIRST, score AFTER — don't gate on raw confidence
             raw_rows = result.get('rows', [])
             raw_text = result.get('raw_text', '')
 
@@ -184,10 +161,8 @@ def process_document(file_path: str, config: dict) -> dict:
                 parsed      = parse_invoice_fields(raw_rows, raw_text)
                 parser_conf = score_confidence(parsed, raw_rows)
                 ocr_conf    = result.get('confidence', 0.8)
-                # FIX 1: Weighted average, not multiplication
                 confidence  = round(parser_conf * _PARSER_CONF_WEIGHT + ocr_conf * _OCR_CONF_WEIGHT, 3)
 
-                # Update best partial result
                 if confidence > best_conf or (parsed['rows'] and not best_rows):
                     best_rows   = parsed['rows']
                     best_text   = raw_text
@@ -208,7 +183,6 @@ def process_document(file_path: str, config: dict) -> dict:
             )
 
     # ── LEVEL 2: Scanned OCR ──────────────────────────────────────────────────
-    # FIX 4: HAS_PDF2IMAGE only — Camelot is not an image converter
     if (is_pdf and HAS_PDF2IMAGE) or is_image:
         if HAS_PYTESSERACT or HAS_EASYOCR:
             result = _run_with_timeout(
@@ -222,15 +196,12 @@ def process_document(file_path: str, config: dict) -> dict:
             elif isinstance(result, Exception):
                 warnings_list.append(f"Level 2 failed: {result}")
             elif result.get('text') or result.get('pages', 0) > 0:
-                # FIX 5: Semantic pseudo-rows instead of raw_line dicts
                 pseudo_rows = _text_to_pseudo_rows(result.get('text', ''))
                 parsed      = parse_invoice_fields(pseudo_rows, result.get('text', ''))
                 parser_conf = score_confidence(parsed, pseudo_rows)
                 ocr_conf    = result.get('confidence', 0.8)
-                # FIX 1: Weighted average
                 confidence  = round(parser_conf * _PARSER_CONF_WEIGHT + ocr_conf * _OCR_CONF_WEIGHT, 3)
 
-                # Update best partial result
                 if confidence > best_conf or (parsed['rows'] and not best_rows):
                     best_rows   = parsed['rows']
                     best_text   = result.get('text', '')
@@ -254,16 +225,13 @@ def process_document(file_path: str, config: dict) -> dict:
     needs_ai = allow_ai and should_use_ai_fallback(best_conf, best_fields, config)
 
     if needs_ai:
-        # Return empty rows — caller (Gemini) will re-process the original file
         return _build_result(
             rows=[], text=best_text, conf=0.0,
             method='needs_ai_fallback', fields=best_fields,
             warnings=warnings_list, needs_ai=True,
         )
 
-    # ── FIX 3: Always return best partial result — never discard ──────────────
-    # Even if confidence is below threshold, return whatever we extracted.
-    # This is far better than returning empty rows and confusing the user.
+    # Always return best partial result — never discard
     if best_rows or best_fields:
         warnings_list.append(
             f"OCR confidence below threshold ({best_conf:.2f}). "
@@ -276,7 +244,6 @@ def process_document(file_path: str, config: dict) -> dict:
             warnings=warnings_list, needs_ai=False,
         )
 
-    # Complete failure — no data extracted at all
     warnings_list.append(
         "OCR could not extract any data from this document. "
         "Try a higher quality scan, or enable gemini_fallback."
@@ -291,7 +258,7 @@ def process_document(file_path: str, config: dict) -> dict:
 def _build_result(rows, text, conf, method, fields, warnings, needs_ai) -> dict:
     return {
         'rows'           : rows,
-        'rawText'        : text[:500] if text else '',   # cap before Node gets it
+        'rawText'        : text[:500] if text else '',
         'confidence'     : conf,
         'method'         : method,
         'warnings'       : warnings,
@@ -303,25 +270,30 @@ def _build_result(rows, text, conf, method, fields, warnings, needs_ai) -> dict:
 def _run_with_timeout(fn, timeout: int, label: str):
     """
     Run fn() with a hard timeout.
-    FIX 6: Uses multiprocessing.Process so the OCR work is truly killed
-    on timeout (thread-based timeout left zombie threads consuming CPU/RAM).
-    Falls back to threading if multiprocessing is unavailable.
 
-    Returns:
-      - fn() result on success
-      - None on timeout
-      - Exception instance on error
+    WINDOWS FIX: On Windows, always use threading (_run_with_timeout_thread).
+    Multiprocessing on Windows requires the 'spawn' start method and the
+    if __name__ == '__main__' guard. When called from an imported module
+    (as is always the case here), spawning a new process re-imports this
+    module in the child, which tries to spawn another process, causing
+    an infinite recursive spawn loop that hangs for the entire timeout period.
+
+    On Linux/Mac: use multiprocessing for true kill on timeout (preferred).
+    On Windows: use threading (cannot truly kill, but does not hang).
     """
-    # Try multiprocessing first for true kill on timeout
-    try:
-        return _run_with_timeout_process(fn, timeout, label)
-    except Exception:
-        # Fallback: threading (no true kill, but better than nothing)
+    if _IS_WINDOWS:
+        # Always use threading on Windows — multiprocessing hangs here
         return _run_with_timeout_thread(fn, timeout, label)
+    else:
+        # Use multiprocessing on Linux/Mac — true kill on timeout
+        try:
+            return _run_with_timeout_process(fn, timeout, label)
+        except Exception:
+            return _run_with_timeout_thread(fn, timeout, label)
 
 
 def _run_with_timeout_process(fn, timeout: int, label: str):
-    """Multiprocessing-based timeout — process can be truly killed."""
+    """Multiprocessing-based timeout — Linux/Mac only. True kill on timeout."""
     result_queue = multiprocessing.Queue()
     error_queue  = multiprocessing.Queue()
 
@@ -336,7 +308,6 @@ def _run_with_timeout_process(fn, timeout: int, label: str):
     proc.join(timeout=timeout)
 
     if proc.is_alive():
-        # FIX 6: TRULY kill the process — no zombie threads
         proc.terminate()
         proc.join(timeout=5)
         if proc.is_alive():
@@ -350,11 +321,11 @@ def _run_with_timeout_process(fn, timeout: int, label: str):
     if not result_queue.empty():
         return result_queue.get()
 
-    return None  # process exited with no result (shouldn't happen)
+    return None
 
 
 def _run_with_timeout_thread(fn, timeout: int, label: str):
-    """Thread-based timeout fallback — thread cannot be truly killed."""
+    """Thread-based timeout — used on Windows and as fallback."""
     result_holder = [None]
     error_holder  = [None]
     done_event    = threading.Event()
@@ -372,7 +343,7 @@ def _run_with_timeout_thread(fn, timeout: int, label: str):
     finished = done_event.wait(timeout=timeout)
 
     if not finished:
-        return None  # timed out — thread will eventually die with the process
+        return None  # timeout — thread eventually dies with the process
 
     if error_holder[0] is not None:
         return error_holder[0]
@@ -383,19 +354,12 @@ def _run_with_timeout_thread(fn, timeout: int, label: str):
 def _text_to_pseudo_rows(text: str) -> list:
     """
     Convert flat OCR text into pseudo-rows for the invoice parser.
-
-    FIX 5: Previous version returned [{'raw_line': line}] which the
-    invoice parser's column-scanning logic couldn't match against any
-    known field names (vendor, amount, invoice_number etc.).
-
-    Now each line is scanned for key-value patterns and stored under
-    field names the parser recognizes. The raw_line is still kept for
-    the regex fallback that scans the full combined text.
+    Each line is scanned for key-value patterns and stored under
+    field names the parser recognizes.
     """
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     rows  = []
 
-    # Known field label patterns to detect inline key:value pairs
     _KV_PATTERNS = [
         (r'invoice\s*(?:no|num|number|#|id|ref)[\s:\.]+(.+)', 'invoice_number'),
         (r'vendor|supplier|from|billed\s*by[\s:]+(.+)',        'vendor_name'),
@@ -408,18 +372,16 @@ def _text_to_pseudo_rows(text: str) -> list:
     for i, line in enumerate(lines):
         row = {'raw_line': line, 'line_index': i}
 
-        # Try to extract key-value from this line
         for pattern, field_name in _KV_PATTERNS:
             m = re.search(pattern, line, re.IGNORECASE)
             if m:
                 val = m.group(1).strip() if m.lastindex >= 1 else ''
                 if val:
-                    # Don't overwrite 'amount' with 'amount_raw' (lower priority)
                     if field_name == 'amount_raw' and 'amount' not in row:
                         row['amount'] = val
                     elif field_name != 'amount_raw':
                         row[field_name] = val
-                break  # one field per line is enough
+                break
 
         rows.append(row)
 

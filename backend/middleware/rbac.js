@@ -26,7 +26,13 @@ const ROLE_LEVELS = {
   admin   : 4,
 };
 
-const DEFAULT_ROLE = 'finance';
+// BUG FIX: this was 'finance' — every new/unrecognised user silently got the
+// SECOND-HIGHEST privilege level (can execute reconciliation + download
+// financial output), contradicting the file's own documented intent above
+// ("Default role for all new users: 'reviewer'"). Also used as the fallback
+// in requireRole() below when req.user.role is missing for any reason — a
+// malformed user record should fail SAFE to the lower role, not escalate.
+const DEFAULT_ROLE = 'reviewer';
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 

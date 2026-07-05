@@ -43,6 +43,10 @@ const OCR_TIMEOUT_MS        = parseInt(process.env.REACT_APP_OCR_TIMEOUT_MS     
 const RECONCILE_TIMEOUT_MS  = parseInt(process.env.REACT_APP_RECONCILE_TIMEOUT_MS  || '660000', 10); // 11 min
 const EXECUTE_TIMEOUT_MS    = parseInt(process.env.REACT_APP_EXECUTE_TIMEOUT_MS    || '660000', 10); // 11 min
 const POLL_TIMEOUT_MS       = parseInt(process.env.REACT_APP_POLL_TIMEOUT_MS       || '10000',  10); // 10s
+// FIX: plain CSV/XLSX/ZIP/XML uploads (dataAPI.upload, uploadAPI.*) were still
+// stuck on the 30s FETCH_TIMEOUT_MS default even though the dropzone advertises
+// files up to 500MB. Matches the backend's new UPLOAD_ROUTE_TIMEOUT_MS (app.js).
+const UPLOAD_TIMEOUT_MS     = parseInt(process.env.REACT_APP_UPLOAD_TIMEOUT_MS     || '300000', 10); // 5 min
 
 // FIX 6 (V3): Warn if localhost in production build
 if (process.env.NODE_ENV === 'production' && BASE_URL.includes('localhost')) {
@@ -154,10 +158,11 @@ export const authAPI = {
 };
 
 export const dataAPI = {
+  // FIX: was missing timeoutMs override — 500MB uploads were aborting at the 30s default
   upload: (file, token) => {
     const formData = new FormData();
     formData.append('file', file);
-    return request('POST', '/api/data/upload', formData, token, true);
+    return request('POST', '/api/data/upload', formData, token, true, { timeoutMs: UPLOAD_TIMEOUT_MS });
   },
   preview : (datasetId, token) => request('GET', `/api/data/${datasetId}/preview`, null, token),
   analyze : (datasetId, token) => request('GET', `/api/data/${datasetId}/analyze`, null, token),
@@ -169,28 +174,29 @@ export const dataAPI = {
     request('POST', '/api/upload/register-server', { serverPath, originalName }, token),
 };
 
+// FIX: all file-accepting functions below were missing timeoutMs — same 30s bug as dataAPI.upload
 export const uploadAPI = {
   zip: (file, token) => {
     const fd = new FormData();
     fd.append('file', file);
-    return request('POST', '/api/upload/zip', fd, token, true);
+    return request('POST', '/api/upload/zip', fd, token, true, { timeoutMs: UPLOAD_TIMEOUT_MS });
   },
   xml: (file, token) => {
     const fd = new FormData();
     fd.append('file', file);
-    return request('POST', '/api/upload/xml', fd, token, true);
+    return request('POST', '/api/upload/xml', fd, token, true, { timeoutMs: UPLOAD_TIMEOUT_MS });
   },
   parse: (file, token) => {
     const fd = new FormData();
     fd.append('file', file);
-    return request('POST', '/api/upload/parse', fd, token, true);
+    return request('POST', '/api/upload/parse', fd, token, true, { timeoutMs: UPLOAD_TIMEOUT_MS });
   },
   parseServerPath: (serverPath, token) =>
     request('POST', '/api/upload/parse-server', { serverPath }, token),
   multi: (files, token) => {
     const fd = new FormData();
     files.forEach(f => fd.append('files', f));
-    return request('POST', '/api/upload/multi', fd, token, true);
+    return request('POST', '/api/upload/multi', fd, token, true, { timeoutMs: UPLOAD_TIMEOUT_MS });
   },
 };
 

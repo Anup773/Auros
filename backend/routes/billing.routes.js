@@ -47,9 +47,13 @@ router.post('/checkout', requireAuth, async (req, res, next) => {
 });
 
 // ── GET /api/billing/subscription ─────────────────────────────────────────────
-router.get('/subscription', requireAuth, (req, res) => {
-  const sub = paddle.getSubscription(req.user.id);
-  res.json({ subscription: sub });
+router.get('/subscription', requireAuth, async (req, res, next) => {
+  try {
+    const sub = await paddle.getSubscription(req.user.id);
+    res.json({ subscription: sub });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ── GET /api/billing/portal ───────────────────────────────────────────────────

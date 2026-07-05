@@ -82,29 +82,103 @@ const PLANS = {
 };
 
 // ── Stores ────────────────────────────────────────────────────────────────────
-// TODO production: replace both Maps with DB queries
+// FIX (production-readiness): both stores were in-memory Maps only — all
+// subscription data was lost on every server restart, and webhook replay
+// protection reset to empty on every restart too (so a restart right after
+// a webhook could let a retried delivery double-process a payment event).
+// Neither problem needed a database — this project already runs Redis for
+// BullMQ, so subscriptions and processed-webhook-IDs are now persisted there
+// too, using the same connection and local-cache pattern already established
+// in reconciliationEngine.service.js. Falls back to the original in-memory
+// Maps ONLY if Redis is genuinely unreachable, so a brief Redis outage
+// degrades gracefully instead of rejecting legitimate webhooks outright.
 
-// userId → subscription object
-const subscriptionStore = new Map();
-
-// Processed webhook event IDs — for replay protection
-// TTL: 24 hours (Paddle retries within this window)
-// TODO production: use Redis SET with 24h TTL
-const _processedEventIds = new Map(); // eventId → processedAt timestamp
+const _localSubCache = new Map();          // userId → subscription (L1 cache)
+const _localEventIds = new Map();          // eventId → processedAt (fallback only)
 const EVENT_ID_TTL_MS    = 24 * 60 * 60 * 1000;
+const SUB_KEY_PREFIX     = 'paddle:sub:';
+const EVENT_KEY_PREFIX   = 'paddle:webhook_seen:';
 
-// Auto-cleanup old event IDs every hour
-setInterval(() => {
-  const now     = Date.now();
-  let   removed = 0;
-  for (const [id, ts] of _processedEventIds.entries()) {
-    if (now - ts > EVENT_ID_TTL_MS) {
-      _processedEventIds.delete(id);
-      removed++;
+let _redisClient    = null;
+let _redisAvailable = false;
+
+try {
+  const { CONNECTION } = require('../../queues/jobQueue');
+  const IORedis = require('ioredis');
+  _redisClient = new IORedis({
+    ...CONNECTION,
+    lazyConnect         : false,
+    enableOfflineQueue  : true,
+    maxRetriesPerRequest: null,
+  });
+  _redisClient.on('error', (err) => {
+    if (!err.message.includes('ECONNREFUSED') && !err.message.includes('connect')) {
+      console.error('[paddle] Redis error:', err.message);
+    }
+  });
+  _redisClient.on('ready', () => {
+    _redisAvailable = true;
+    console.log('[paddle] Redis connected — subscription + webhook state now persisted.');
+  });
+} catch (err) {
+  console.warn('[paddle] Redis not available — subscription state will NOT survive a restart:', err.message);
+}
+
+async function _getSubscription(userId) {
+  if (_redisAvailable) {
+    try {
+      const raw = await _redisClient.get(`${SUB_KEY_PREFIX}${userId}`);
+      if (raw) {
+        const sub = JSON.parse(raw);
+        _localSubCache.set(userId, sub);
+        return sub;
+      }
+      return null;
+    } catch (err) {
+      console.warn('[paddle] Redis read failed, using local cache:', err.message);
     }
   }
-  if (removed > 0) {
-    console.log(`[paddle] Cleaned ${removed} old webhook event ID(s).`);
+  return _localSubCache.get(userId) || null;
+}
+
+async function _setSubscription(userId, sub) {
+  _localSubCache.set(userId, sub);  // always keep the local cache warm
+  if (_redisAvailable) {
+    try {
+      // No TTL — subscription state is intentionally durable, not a cache entry.
+      await _redisClient.set(`${SUB_KEY_PREFIX}${userId}`, JSON.stringify(sub));
+    } catch (err) {
+      console.error('[paddle] CRITICAL: failed to persist subscription for', userId, ':', err.message);
+    }
+  }
+}
+
+async function _hasProcessedEvent(eventId) {
+  if (_redisAvailable) {
+    try {
+      // Atomic check-and-mark: SET ... NX fails (returns null) if the key
+      // already exists, closing the race a separate GET-then-SET would have
+      // if two webhook deliveries for the same event arrive close together.
+      const result = await _redisClient.set(
+        `${EVENT_KEY_PREFIX}${eventId}`, '1', 'EX', Math.floor(EVENT_ID_TTL_MS / 1000), 'NX'
+      );
+      return result === null;  // null = key already existed = already processed
+    } catch (err) {
+      console.warn('[paddle] Redis dedup check failed, using local fallback:', err.message);
+    }
+  }
+  // Local fallback (single-process only — not safe across multiple instances)
+  if (_localEventIds.has(eventId)) return true;
+  _localEventIds.set(eventId, Date.now());
+  return false;
+}
+
+// Local-cache cleanup (only matters when Redis is unavailable and this Map
+// is the sole store — Redis entries expire themselves via EX above)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, ts] of _localEventIds.entries()) {
+    if (now - ts > EVENT_ID_TTL_MS) _localEventIds.delete(id);
   }
 }, 60 * 60 * 1000);
 
@@ -188,21 +262,21 @@ async function createCheckout(planId, userId, userEmail, returnUrl) {
   };
 }
 
-function getSubscription(userId) {
-  const sub = subscriptionStore.get(userId);
+async function getSubscription(userId) {
+  const sub = await _getSubscription(userId);
   if (!sub) {
     return { active: false, plan: null, status: 'none', trialEnds: null, renewsAt: null };
   }
   return sub;
 }
 
-function hasActiveSubscription(userId) {
-  const sub = getSubscription(userId);
+async function hasActiveSubscription(userId) {
+  const sub = await getSubscription(userId);
   return sub.active && (sub.status === 'active' || sub.status === 'trialing');
 }
 
 async function getPortalUrl(userId) {
-  const sub = subscriptionStore.get(userId);
+  const sub = await _getSubscription(userId);
   if (!sub?.paddleCustomerId) {
     throw Object.assign(new Error('No active subscription found'), { status: 404, code: 'NO_SUBSCRIPTION' });
   }
@@ -217,7 +291,7 @@ async function getPortalUrl(userId) {
 }
 
 async function cancelSubscription(userId) {
-  const sub = subscriptionStore.get(userId);
+  const sub = await _getSubscription(userId);
   if (!sub?.paddleSubscriptionId) {
     throw Object.assign(new Error('No active subscription found'), { status: 404 });
   }
@@ -228,7 +302,7 @@ async function cancelSubscription(userId) {
 
   sub.cancelAtPeriodEnd = true;
   sub.status            = 'canceling';
-  subscriptionStore.set(userId, sub);
+  await _setSubscription(userId, sub);
 
   return { success: true, message: 'Subscription will cancel at end of billing period.' };
 }
@@ -311,15 +385,13 @@ async function processWebhookEvent(event) {
   const eventId   = event.eventId   || event.event_id || event.data?.id;
   const data      = event.data;
 
-  // ── NEW: Replay protection ────────────────────────────────────────────────
+  // ── Replay protection (now atomic + persisted across restarts/instances) ──
   if (eventId) {
-    if (_processedEventIds.has(eventId)) {
+    const alreadyProcessed = await _hasProcessedEvent(eventId);
+    if (alreadyProcessed) {
       console.log(`[paddle] Webhook event ${eventId} already processed — skipping (replay protection).`);
       return { alreadyProcessed: true, eventId };
     }
-    // Mark as processed immediately before doing any work
-    // This prevents race conditions if Paddle sends the same event twice quickly
-    _processedEventIds.set(eventId, Date.now());
   }
 
   console.log(`[paddle] Webhook: ${eventType}${eventId ? ` (${eventId})` : ''}`);
@@ -333,8 +405,7 @@ async function processWebhookEvent(event) {
 
       const planId = _getPlanFromPriceId(data.items?.[0]?.price?.id);
 
-      // TODO production: DB.upsert('subscriptions', { userId, ... })
-      subscriptionStore.set(userId, {
+      await _setSubscription(userId, {
         active               : true,
         plan                 : planId,
         status               : data.status,
@@ -356,9 +427,8 @@ async function processWebhookEvent(event) {
       const userId = data.customData?.userId || data.custom_data?.userId;
       if (!userId) break;
 
-      const existing = subscriptionStore.get(userId) || {};
-      // TODO production: DB.update('subscriptions', { userId }, { status, renewsAt, plan })
-      subscriptionStore.set(userId, {
+      const existing = await _getSubscription(userId) || {};
+      await _setSubscription(userId, {
         ...existing,
         status  : data.status,
         renewsAt: data.nextBilledAt || data.next_billed_at,
@@ -371,9 +441,8 @@ async function processWebhookEvent(event) {
       const userId = data.customData?.userId || data.custom_data?.userId;
       if (!userId) break;
 
-      const existing = subscriptionStore.get(userId) || {};
-      // TODO production: DB.update('subscriptions', { userId }, { active: false, status: 'canceled' })
-      subscriptionStore.set(userId, {
+      const existing = await _getSubscription(userId) || {};
+      await _setSubscription(userId, {
         ...existing,
         active     : false,
         status     : 'canceled',
@@ -386,8 +455,8 @@ async function processWebhookEvent(event) {
     case 'subscription.past_due': {
       const userId = data.customData?.userId || data.custom_data?.userId;
       if (!userId) break;
-      const existing = subscriptionStore.get(userId) || {};
-      subscriptionStore.set(userId, { ...existing, status: 'past_due' });
+      const existing = await _getSubscription(userId) || {};
+      await _setSubscription(userId, { ...existing, status: 'past_due' });
       break;
     }
 
@@ -422,6 +491,5 @@ module.exports = {
   cancelSubscription,
   verifyWebhookSignature,
   processWebhookEvent,
-  subscriptionStore,
   PLANS,
 };

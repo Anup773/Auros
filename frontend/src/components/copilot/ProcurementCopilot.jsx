@@ -728,10 +728,21 @@ function _localParse(text, ambiguities) {
   ];
 
   for (const { keywords, action } of PATTERNS) {
-    if (!keywords.some(kw => t.includes(kw))) continue;
+    // BATCH-2 FIX: typo tolerance — "aprove" (missing a letter) previously
+    // never matched "approve" here, silently falling through to
+    // "No matching items found" even though the backend parser now handles
+    // this exact typo correctly. _fuzzyIncludes closes that gap for this
+    // backup path too (only used when the real backend call fails).
+    if (!keywords.some(kw => t.includes(kw) || (kw.length >= 4 && !kw.includes(' ') && _fuzzyIncludes(t, kw)))) continue;
     let indices = [];
 
     const rangeMatch = t.match(/(\d+)\s*(?:to|through|-|–)\s*(\d+)/);
+    // BATCH-2 FIX: "45 items" / "10 invoices" = a QUANTITY, not item #45.
+    // Guarded against first/last/next/up-to since those imply a specific
+    // end of the list, not "the next N from the front".
+    const countMatch = !rangeMatch && t.match(/\b(\d+)\s*(?:items?|invoices?|rows?|records?)\b/i);
+    const hasDirectionalKw = /\b(first|last|next|up\s*to|upto)\b/i.test(t);
+
     if (rangeMatch) {
       const from = parseInt(rangeMatch[1]) - 1;
       const to   = parseInt(rangeMatch[2]) - 1;
@@ -740,6 +751,11 @@ function _localParse(text, ambiguities) {
       }
     } else if (t.includes('all') || t.includes('every') || t.includes('rest')) {
       for (let i = 0; i < total; i++) {
+        if (!covered.has(i) && !ambiguities[i]?.answered) indices.push(i);
+      }
+    } else if (countMatch && !hasDirectionalKw) {
+      const n = parseInt(countMatch[1], 10);
+      for (let i = 0; i < total && indices.length < n; i++) {
         if (!covered.has(i) && !ambiguities[i]?.answered) indices.push(i);
       }
     } else {
@@ -766,6 +782,23 @@ function _localParse(text, ambiguities) {
         }).join(' · ')
       : 'No matching items found',
   };
+}
+
+// BATCH-2 FIX: minimal Levenshtein distance — supports typo tolerance above
+// without pulling in a fuzzy-matching library for one small backup path.
+function _levenshtein(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[a.length][b.length];
+}
+function _fuzzyIncludes(text, word, maxDist = 1) {
+  const tokens = text.match(/\b[a-z]+\b/g) || [];
+  return tokens.some(tok => tok.length >= 4 && _levenshtein(tok, word) <= maxDist);
 }
 
 function _sanitise(ambiguities) {

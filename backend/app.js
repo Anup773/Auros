@@ -70,9 +70,36 @@ const { validate, schemas, sanitiseParams } = require('./middleware/validate');
 
 const app = express();
 
-// Exported so server.js can apply it to the HTTP server instance
+// Exported so server.js can apply it to the HTTP server instance.
+// This stays a SHORT default (30s) on purpose — it's the slowloris/stalled-
+// connection guard for lightweight routes (auth, health, voice, ai chat, etc.)
+// Heavy routes (OCR, uploads, reconcile/execute) get their own longer socket
+// timeout below via extendTimeout(), instead of raising this global value.
+// Raising the global value would weaken slowloris protection on every fast
+// route just to accommodate a handful of slow ones.
 const TIMEOUT_MS = parseInt(process.env.SERVER_TIMEOUT_MS || '30000', 10);
 app.locals.TIMEOUT_MS = TIMEOUT_MS;
+
+// ── Per-route socket timeout override ─────────────────────────────────────────
+// FIX: server.setTimeout(TIMEOUT_MS) in server.js applies a 30s socket-idle
+// timeout to EVERY connection by default. The frontend (api.js V4) was fixed
+// to wait up to 660s for reconcile/execute and 360s for OCR — but the server
+// socket was still killing those same connections at 30s, before the
+// patient frontend timeout ever got a chance to fire. This produced
+// "Network error: Failed to fetch" (a raw connection reset) even though the
+// backend was still working correctly, just slower than 30s.
+// req.setTimeout()/res.setTimeout() override the default for that one
+// request's socket only — every other route keeps the fast 30s default.
+function extendTimeout(ms) {
+  return (req, res, next) => {
+    req.setTimeout(ms);
+    res.setTimeout(ms);
+    next();
+  };
+}
+const OCR_ROUTE_TIMEOUT_MS         = parseInt(process.env.OCR_ROUTE_TIMEOUT_MS         || '360000', 10); // 6 min — matches frontend OCR_TIMEOUT_MS
+const UPLOAD_ROUTE_TIMEOUT_MS      = parseInt(process.env.UPLOAD_ROUTE_TIMEOUT_MS      || '300000', 10); // 5 min — large CSV/XLSX/ZIP parsing
+const PROCUREMENT_ROUTE_TIMEOUT_MS = parseInt(process.env.PROCUREMENT_ROUTE_TIMEOUT_MS || '660000', 10); // 11 min — matches frontend RECONCILE/EXECUTE_TIMEOUT_MS
 
 // ── Trust proxy ───────────────────────────────────────────────────────────────
 if (process.env.TRUST_PROXY === 'true') {
@@ -211,7 +238,8 @@ app.use('/api/auth/google', authLimiter, validate(schemas.googleAuth));
 app.use('/api/auth',        require('./routes/auth.routes'));
 
 // Data (includes authenticated file-serving endpoint — replaces public /uploads)
-app.use('/api/data',        uploadLimiter, require('./routes/data.routes'));
+// FIX: extendTimeout — large CSV/XLSX/ZIP uploads (up to 500MB) need more than 30s
+app.use('/api/data',        uploadLimiter, extendTimeout(UPLOAD_ROUTE_TIMEOUT_MS), require('./routes/data.routes'));
 
 // AI
 app.use('/api/ai',          aiLimiter, require('./routes/ai.routes'));
@@ -223,16 +251,19 @@ app.use('/api/voice',       voiceLimiter, require('./routes/voice.routes'));
 app.use('/api/pipeline',    require('./routes/pipeline.routes'));
 
 // Upload
-app.use('/api/upload',      uploadLimiter, require('./routes/upload.routes'));
+// FIX: extendTimeout — same reasoning as /api/data above
+app.use('/api/upload',      uploadLimiter, extendTimeout(UPLOAD_ROUTE_TIMEOUT_MS), require('./routes/upload.routes'));
 
 // Procurement
-app.use('/api/procurement', sanitiseParams, require('./routes/procurement.routes'));
+// FIX: extendTimeout — reconcile/execute can legitimately run for minutes on large invoice sets
+app.use('/api/procurement', sanitiseParams, extendTimeout(PROCUREMENT_ROUTE_TIMEOUT_MS), require('./routes/procurement.routes'));
 
 // WhatsApp
 app.use('/api/whatsapp',    require('./routes/whatsapp.routes'));
 
 // OCR
-app.use('/api/ocr',         uploadLimiter, require('./routes/ocr.routes'));
+// FIX: extendTimeout — OCR can legitimately take up to OCR_PYBRIDGE_TIMEOUT_MS (320s) server-side
+app.use('/api/ocr',         uploadLimiter, extendTimeout(OCR_ROUTE_TIMEOUT_MS), require('./routes/ocr.routes'));
 
 // Billing — webhook sub-route MUST internally override body parser with express.raw()
 // See NOTE above in body-parsing section for details.

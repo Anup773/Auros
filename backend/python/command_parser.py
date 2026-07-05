@@ -316,6 +316,17 @@ _RE_ITEM_REF = re.compile(
     r'\bitem\s+(?:number|no\.?|#)?\s*(\d+)\b',
     re.IGNORECASE
 )
+# BATCH-2 FIX: "45 items" / "100 invoices" / "50 rows" — a number BEFORE a
+# plural-capable count noun means QUANTITY, not a position reference.
+# Without this, "approve 45 items for payment" fell through to the bare-number
+# branch (Section 11, step 3) which reads "45" as item #45 (a single row) —
+# this is why that exact command only actioned 1 item instead of 45.
+# Word order is the disambiguator: "item 45" (noun-then-number, handled by
+# _RE_ITEM_REF above) is a position; "45 items" (number-then-noun) is a count.
+_RE_COUNT_N = re.compile(
+    r'\b(\d[\d,]*)\s*(?:items?|invoices?|rows?|records?)\b',
+    re.IGNORECASE
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 2 — SELECTION EXPRESSION (FIX-07 / FIX-14 / FIX-25)
@@ -1194,6 +1205,35 @@ def _parse_target(
         if 0 <= idx < total and idx not in exclude:
             return SelectionExpr(type="indices", values=[idx], total=total), "item_ref", 0.0, "item_ref"
 
+    # ── BATCH-2 FIX: "N items/invoices/rows/records" = quantity, not position ──
+    # Must run BEFORE the bare-number fallback in step 3 below, which would
+    # otherwise read "45" in "approve 45 items" as a single item's position.
+    # Selects the first N items that are not yet answered, in document order —
+    # this is what a user means by "approve 45 items": the next 45 still
+    # awaiting a decision, not literally row index 45.
+    #
+    # GUARD: only fires when NO directional keyword is present. "the last 10
+    # invoices" / "up to 20 items" / "next 5 rows" already have correct
+    # direction-aware handling below via _RE_LAST_N / _RE_UP_TO / _RE_NEXT_N —
+    # this generic count check must defer to those, or "last 10" would
+    # incorrectly grab the FIRST 10 unanswered items instead of the final 10.
+    count_m = _RE_COUNT_N.search(t)
+    has_directional_kw = bool(
+        _RE_FIRST_N.search(t) or _RE_LAST_N.search(t) or
+        _RE_NEXT_N.search(t)  or _RE_UP_TO.search(t)
+    )
+    if count_m and not has_directional_kw:
+        n = int(count_m.group(1).replace(',', ''))
+        unanswered = [
+            i for i in range(total)
+            if i not in exclude
+            and (not ambiguities or i >= len(ambiguities) or not ambiguities[i].get("answered", False))
+        ]
+        take = unanswered[:n]
+        if take:
+            return SelectionExpr(type="indices", values=take, total=total), "count_n", 0.0, "count_n"
+        return SelectionExpr(type="empty", total=total), "count_n", 0.20, "count_n_no_targets"
+
     # ── 1. Position spec (up to N / first N / last N / range / remaining) ────
     spec_sel, spec_type = _parse_position_spec(t, total, exclude)
     if spec_type == "remaining":
@@ -1832,4 +1872,3 @@ if __name__ == "__main__":
             "trace": tb,
         }))
         sys.stdout.flush()
-

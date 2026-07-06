@@ -6,6 +6,18 @@
  * Stricter limits on auth endpoints to prevent brute force.
  *
  * Install: npm install express-rate-limit
+ *
+ * FIX (NEW) — GLOBAL LIMITER BLOCKED NORMAL JOB-STATUS POLLING
+ *   Old: globalLimiter allowed only 200 requests / 15 min per IP, applied to
+ *        EVERY route including GET /api/procurement/:jobId. But
+ *        ProcurementWorkspace.jsx polls that endpoint every 2 seconds for up
+ *        to 10 minutes per job (up to 300 requests) — one single
+ *        reconciliation job could burn through the entire window's budget by
+ *        itself. Any upload attempted afterward got an immediate
+ *        "Too many requests" 429, even though the user made no unusual
+ *        number of real requests.
+ *   New: job-status polling (GET /api/procurement/job_*) is exempted from
+ *        the global limiter, the same way /health already was.
  */
 
 const rateLimit = require('express-rate-limit');
@@ -17,7 +29,9 @@ const globalLimiter = rateLimit({
   standardHeaders : true,
   legacyHeaders   : false,
   message         : { error: 'Too many requests. Please try again later.', code: 'RATE_LIMITED' },
-  skip            : (req) => req.path === '/health', // never limit health checks
+  skip            : (req) =>
+    req.path === '/health' ||                       // never limit health checks
+    /^\/api\/procurement\/job_/.test(req.path),      // FIX: never limit job-status polling
 });
 
 // ── Auth limiter — stricter for login/signup ──────────────────────────────────

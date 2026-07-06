@@ -53,9 +53,47 @@
  *   strategies, retry backoff for non-OCR operations).
  */
 
-const { spawn } = require('child_process');
+const { spawn, exec } = require('child_process');
 const path      = require('path');
 const os        = require('os');
+
+const _IS_WINDOWS = os.platform() === 'win32';
+
+/**
+ * FIX 6 (NEW) — WINDOWS ORPHANED CHILD PROCESS CLEANUP
+ *
+ *   Root cause: On Windows, ocr_engine.py uses a THREAD-based timeout
+ *   (documented in that file) because multiprocessing.Process hangs when
+ *   imported from another module. A Python thread cannot be forcibly killed.
+ *
+ *   pytesseract and pdf2image don't do OCR in-process — they shell out to
+ *   real native binaries (tesseract.exe, poppler's pdftoppm.exe) as SEPARATE
+ *   OS processes. When our timeout fires and we call proc.kill('SIGKILL') on
+ *   the parent python.exe, Windows does NOT kill child processes automatically
+ *   (no job-object/process-tree cleanup like POSIX process groups give you).
+ *
+ *   Result: every OCR timeout left tesseract.exe / pdftoppm.exe running in
+ *   the background, consuming CPU for minutes afterward — starving every
+ *   other Python spawn (CSV/XLSX parsing included, since they share this same
+ *   module's concurrency semaphore) and making unrelated uploads appear to
+ *   hang for 10-20+ minutes even though nothing was actually deadlocked.
+ *
+ *   Fix: on Windows, kill the ENTIRE process tree with
+ *   `taskkill /PID <pid> /T /F` instead of a plain SIGKILL. `/T` kills all
+ *   child processes, `/F` forces termination. On Linux/Mac, SIGKILL already
+ *   kills the process; this is only needed on Windows.
+ */
+function _killProcessTree(proc) {
+  if (_IS_WINDOWS && proc.pid) {
+    exec(`taskkill /PID ${proc.pid} /T /F`, (err) => {
+      if (err) {
+        console.warn(`[pythonBridge] taskkill failed for PID ${proc.pid} (process may have already exited):`, err.message);
+      }
+    });
+  } else {
+    try { proc.kill('SIGKILL'); } catch (_) {}
+  }
+}
 
 const DEFAULT_ENGINE_PATH = path.join(__dirname, '../python/data_engine.py');
 const PYTHON_BIN          = process.env.PYTHON_BIN || (os.platform() === 'win32' ? 'python' : 'python3');
@@ -78,24 +116,66 @@ const MAX_CONCURRENT_SPAWNS = parseInt(process.env.PYTHON_MAX_CONCURRENT || '4',
 let _activeSpawns = 0;
 const _spawnQueue = [];
 
-function _acquireSpawnSlot() {
-  return new Promise(resolve => {
+// FIX #12 (NEW) — SPAWN-SLOT QUEUE WAIT HAD NO TIMEOUT (root cause of the
+// 20-minute silent "Parse & Validate" hangs on CSV/XLSX uploads)
+//
+//   Every Python operation — OCR, CSV/XLSX parsing, reconciliation, ZIP
+//   extraction — funnels through this SAME module-level semaphore, capped at
+//   MAX_CONCURRENT_SPAWNS (default 4) for the entire process. worker.js alone
+//   runs up to 12 concurrent BullMQ job handlers (OCR:2 + Parse:3 +
+//   Reconcile:2 + ZIP:3 + Voice:2) that all compete for those same 4 slots.
+//
+//   _acquireSpawnSlot() returned a Promise that resolved ONLY when a slot
+//   freed up — with no timeout on the wait itself. If OCR jobs (up to 320s
+//   each) backed up the queue, anything else waiting for a slot — including a
+//   small CSV upload — could sit there indefinitely with zero feedback to the
+//   user. That's the "stuck loading for 20+ minutes" behavior: not a crash,
+//   not a deadlock, just an uncapped wait in a queue with no visibility.
+//
+//   Fix: _acquireSpawnSlot() now takes a maxWaitMs (default 90s) and rejects
+//   with a clear, actionable QUEUE_TIMEOUT error if no slot frees up in time,
+//   instead of waiting silently forever. callEngine() surfaces this as a
+//   normal error the frontend can display and let the user retry.
+const SPAWN_QUEUE_TIMEOUT_MS = parseInt(process.env.PYTHON_QUEUE_TIMEOUT_MS || '90000', 10);
+
+function _acquireSpawnSlot(maxWaitMs = SPAWN_QUEUE_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
     if (_activeSpawns < MAX_CONCURRENT_SPAWNS) {
       _activeSpawns++;
       resolve();
-    } else {
-      _spawnQueue.push(resolve);
+      return;
     }
+
+    const waiter = { resolve, timer: null, resolved: false };
+
+    waiter.timer = setTimeout(() => {
+      if (waiter.resolved) return;
+      waiter.resolved = true;
+      const idx = _spawnQueue.indexOf(waiter);
+      if (idx !== -1) _spawnQueue.splice(idx, 1);
+      const err  = new Error(
+        `Timed out after ${Math.round(maxWaitMs / 1000)}s waiting for a free Python ` +
+        `execution slot (${MAX_CONCURRENT_SPAWNS} max, all busy). The system is under ` +
+        `heavy load — please try again shortly.`
+      );
+      err.code = 'QUEUE_TIMEOUT';
+      reject(err);
+    }, maxWaitMs);
+
+    _spawnQueue.push(waiter);
   });
 }
 
 function _releaseSpawnSlot() {
-  if (_spawnQueue.length > 0) {
+  while (_spawnQueue.length > 0) {
     const next = _spawnQueue.shift();
-    next(); // next waiter takes the slot immediately
-  } else {
-    _activeSpawns--;
+    if (next.resolved) continue; // already timed out — skip, try the next waiter
+    next.resolved = true;
+    clearTimeout(next.timer);
+    next.resolve(); // next waiter takes the slot immediately
+    return;
   }
+  _activeSpawns--;
 }
 
 console.log('[pythonBridge] Python binary:', PYTHON_BIN);
@@ -103,6 +183,7 @@ console.log('[pythonBridge] Default engine:', DEFAULT_ENGINE_PATH);
 console.log(`[pythonBridge] Max stdout: ${Math.round(MAX_STDOUT_BYTES / 1024 / 1024)} MB`);
 console.log(`[pythonBridge] OCR default timeout: ${Math.round(OCR_DEFAULT_TIMEOUT_MS / 1000)}s`);
 console.log(`[pythonBridge] Max concurrent spawns: ${MAX_CONCURRENT_SPAWNS}`);
+console.log(`[pythonBridge] Process-tree kill on timeout: ${_IS_WINDOWS ? 'taskkill /T /F (Windows)' : 'SIGKILL (POSIX)'}`);
 
 const ALLOWED_OPS = new Set([
   'parse', 'schema', 'analyze', 'reconcile', 'execute', 'extract_zip', 'parse_xml',
@@ -229,7 +310,7 @@ function _spawnEngine(config, enginePath, timeoutMs) {
 
     const timer = setTimeout(() => {
       timedOut = true;
-      try { proc.kill('SIGKILL'); } catch (_) {}
+      _killProcessTree(proc); // FIX 6: kill entire tree, not just python.exe
       const err  = new Error(`Python engine timed out after ${timeoutMs}ms`);
       err.code   = 'ENGINE_TIMEOUT';
       err.status = 504;
@@ -241,7 +322,7 @@ function _spawnEngine(config, enginePath, timeoutMs) {
       stdoutBytes += chunk.length;
 
       if (stdoutBytes > MAX_STDOUT_BYTES) {
-        try { proc.kill('SIGKILL'); } catch (_) {}
+        _killProcessTree(proc); // FIX 6: kill entire tree, not just python.exe
         clearTimeout(timer);
         const err  = new Error(
           `Python engine stdout exceeded ${Math.round(MAX_STDOUT_BYTES / 1024 / 1024)} MB limit. ` +

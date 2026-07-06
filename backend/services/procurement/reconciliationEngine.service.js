@@ -141,6 +141,41 @@ try {
     } catch (err) {
       console.warn('[reconciliationEngine] Could not detect Redis version:', err.message);
     }
+
+    // FIX #10 (NEW) — RECOVER ORPHANED "processing" JOBS ON EVERY RESTART
+    //
+    //   Root cause of "You already have 5 active reconciliation job(s)" even
+    //   when nothing is actually running:
+    //
+    //   _waitForResult() (below) is a purely IN-MEMORY watcher — a Redis
+    //   pub/sub subscription plus a setTimeout fallback, both living only in
+    //   this Node process's memory. It is only ever created inside
+    //   startReconciliation(), at the moment a job is submitted.
+    //
+    //   Every time this server process restarts (which happens constantly
+    //   during development — e.g. after every code change), ANY job that was
+    //   still in the 'processing' state at that instant permanently loses its
+    //   watcher. Nothing in the new process re-attaches one. The job's Redis
+    //   metadata (auros:job:<jobId>) is untouched and keeps its 4-hour TTL
+    //   (JOB_EXPIRY_SEC), so it just sits there reporting status: 'processing'
+    //   for up to 4 hours — even though the actual work finished, failed, or
+    //   was abandoned long ago.
+    //
+    //   _checkQueueLimits() counts exactly these entries. Restart the server
+    //   5 times while a job happens to be mid-flight each time, and every
+    //   future upload gets rejected with "You already have 5 active
+    //   reconciliation job(s)" — even on a completely idle system.
+    //
+    //   Fix: on every startup, once Redis is confirmed ready, scan all
+    //   auros:job:* metadata entries. For each one still marked 'processing':
+    //     - If it's older than RECONCILE_TIMEOUT (10 min) — it's definitely
+    //       orphaned (nothing legitimate runs that long) — mark it 'error' so
+    //       it stops counting against MAX_JOBS_PER_USER.
+    //     - Otherwise, re-attach a live _waitForResult() watcher for it, in
+    //       case the worker is still genuinely processing it and will publish
+    //       a real result shortly (handles the common case of restarting the
+    //       server seconds after submitting a job).
+    await _recoverOrphanedJobs();
   });
 
 } catch (_) {
@@ -203,6 +238,88 @@ async function getJob(jobId) {
     }
   }
   return null;
+}
+
+// FIX #10 (NEW) — see full explanation where this is called, above.
+// Scans every auros:job:* metadata entry once at startup and reconciles any
+// still marked 'processing': either re-attaches a live watcher (job is
+// young enough that the worker might still legitimately be running) or
+// marks it 'error' as orphaned (job is older than RECONCILE_TIMEOUT, so
+// nothing legitimate is still working on it).
+async function _recoverOrphanedJobs() {
+  if (!_redisAvailable) return;
+
+  let cursor    = '0';
+  let recovered = 0;
+  let reattached = 0;
+
+  try {
+    do {
+      const [nextCursor, keys] = await _redisClient.scan(
+        cursor, 'MATCH', `${JOB_META_KEY_PREFIX}*`, 'COUNT', 100
+      );
+      cursor = nextCursor;
+
+      for (const key of keys) {
+        // Skip pub/sub-style keys that happen to share the prefix
+        // (JOB_META_KEY_PREFIX is 'auros:job:', JOB_DONE_CHANNEL_PREFIX is
+        // 'auros:job:done:' — a done-channel key would parse as garbage JSON
+        // below and be safely skipped by the try/catch, but filter explicitly
+        // for clarity).
+        if (key.startsWith(JOB_DONE_CHANNEL_PREFIX)) continue;
+
+        let job;
+        try {
+          const raw = await _redisClient.get(key);
+          if (!raw) continue;
+          job = JSON.parse(raw);
+        } catch (_) {
+          continue; // not valid job JSON — ignore
+        }
+
+        if (!job || job.status !== 'processing') continue;
+
+        const jobAge = Date.now() - new Date(job.createdAt).getTime();
+
+        if (jobAge > RECONCILE_TIMEOUT) {
+          // Orphaned by a previous process — nothing is coming for this job.
+          await _updateJob(job.jobId, {
+            status: 'error',
+            error : 'Job was still processing when the server restarted and ' +
+                    'was never resolved by the previous process. Marked as ' +
+                    'stale on startup recovery.',
+          });
+          recovered++;
+        } else if (job.bullJobId) {
+          // Young enough that the worker might genuinely still be running it —
+          // re-attach a live watcher so it can resolve normally instead of
+          // sitting untouched until its 4-hour Redis TTL expires.
+          const cancelFn = _waitForResult(job.jobId, job.bullJobId);
+          const cached = _localJobCache.get(job.jobId);
+          if (cached) cached._cancelFn = cancelFn;
+          reattached++;
+        } else {
+          // No bullJobId recorded yet (crashed before the queue.add() callback
+          // completed) — there's nothing to re-attach to. Treat as orphaned.
+          await _updateJob(job.jobId, {
+            status: 'error',
+            error : 'Job never received a worker assignment before the ' +
+                    'server restarted. Please re-submit.',
+          });
+          recovered++;
+        }
+      }
+    } while (cursor !== '0');
+
+    if (recovered > 0 || reattached > 0) {
+      console.log(
+        `[reconciliationEngine] Startup recovery: marked ${recovered} orphaned ` +
+        `job(s) as error, re-attached watchers for ${reattached} still-young job(s).`
+      );
+    }
+  } catch (err) {
+    console.warn('[reconciliationEngine] Orphaned-job recovery failed:', err.message);
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

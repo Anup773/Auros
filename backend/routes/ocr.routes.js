@@ -55,6 +55,23 @@
  *        Both the main datasetRegistry (shared with data.controller) and the
  *        cleanup scheduler enforce these limits.
  *
+ * CRITICAL FIX #9 (NEW) — TEMP FILE DELETED WHILE STILL NEEDED (reconciliation crash)
+ *   Old: FIX #1 deleted the uploaded temp file in the /invoice route's finally
+ *        block immediately after every request — success AND error. But the
+ *        SAME file path is stored in datasetRegistry as `filePath` and is read
+ *        AGAIN later when the user starts reconciliation
+ *        (procurement.controller.js -> reconciliationEngine -> BullMQ worker).
+ *        Result: worker.js always failed with
+ *          "File not found: .../auros_ocr/<hash>_<name>.pdf"
+ *        on the very first reconciliation attempt after any OCR upload —
+ *        100% reproducible, not a race condition.
+ *   New: The /invoice route no longer deletes its own temp file. The file's
+ *        lifetime is now tied to its datasetRegistry entry: it is deleted
+ *        when that entry is evicted (LRU cap) or expires (TTL sweep) —
+ *        see _evictOldestOcrDataset() and the cleanup interval below.
+ *        The /batch route is unaffected by this change and still cleans up
+ *        immediately, since batch results are not re-read by reconciliation.
+ *
  * CRITICAL FIX #8 — UNBOUNDED ROWS IN OCR REGISTRY (OOM for large batch OCR)
  *   Old: ocrResult.rows (potentially thousands of rows × many fields) stored
  *        wholesale in the registry with no limit.
@@ -115,8 +132,12 @@ function _evictOldestOcrDataset() {
     if (at < oldestAt) { oldestAt = at; oldestId = id; }
   }
   if (oldestId) {
+    // FIX #9: The temp file is no longer deleted right after the OCR request.
+    // Its lifetime is tied to this registry entry — delete it now, at eviction time.
+    const ds = datasetRegistry.get(oldestId);
+    if (ds?.filePath) _safeUnlink(ds.filePath);
     datasetRegistry.delete(oldestId);
-    console.log(`[ocr.routes] Evicted oldest OCR dataset ${oldestId} from registry.`);
+    console.log(`[ocr.routes] Evicted oldest OCR dataset ${oldestId} from registry (file deleted).`);
   }
 }
 
@@ -135,12 +156,14 @@ const _ocrCleanupInterval = setInterval(() => {
   for (const [id, ds] of datasetRegistry.entries()) {
     if (!ds.fileType?.startsWith('ocr')) continue;
     if (now - new Date(ds.uploadedAt).getTime() > OCR_DATASET_TTL_MS) {
+      // FIX #9: delete the underlying temp file when its registry entry expires
+      if (ds.filePath) _safeUnlink(ds.filePath);
       datasetRegistry.delete(id);
       removed++;
     }
   }
   if (removed > 0) {
-    console.log(`[ocr.routes] Cleaned ${removed} expired OCR dataset(s) from registry.`);
+    console.log(`[ocr.routes] Cleaned ${removed} expired OCR dataset(s) from registry (files deleted).`);
   }
 }, 30 * 60 * 1000);
 
@@ -188,14 +211,18 @@ const upload = multer({
 // ══════════════════════════════════════════════════════════════════════════════
 
 router.post('/invoice', requireAuth, upload.single('file'), async (req, res, next) => {
-  // FIX #1: Track ALL temp paths so finally block always cleans up
-  const tempPaths = [];
+  // FIX #9: This route USED to register req.file.path here for immediate
+  // cleanup (old FIX #1) and delete it in the finally block below. That
+  // broke reconciliation, which reads this exact file path again later via
+  // the datasetRegistry entry created below. The file is now cleaned up
+  // when its registry entry is evicted/expires instead (see
+  // _evictOldestOcrDataset and the TTL sweep above) — NOT here.
+  const tempPaths = []; // intentionally NOT populated with req.file.path
 
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded', code: 'NO_FILE' });
     }
-    tempPaths.push(req.file.path);  // FIX #1: register for cleanup
 
     const gemini_fallback = req.body.gemini_fallback === 'true' ||
                             req.body.gemini_fallback === true;
@@ -275,9 +302,13 @@ router.post('/invoice', requireAuth, upload.single('file'), async (req, res, nex
     });
 
   } catch (err) {
+    // FIX #9: If we failed BEFORE the file made it into datasetRegistry
+    // (e.g. callEngine threw), nothing owns this file yet — clean it up here.
+    if (req.file?.path) _safeUnlink(req.file.path);
     next(err);
   } finally {
-    // FIX #1: Always clean up temp files — success AND error paths
+    // Any paths explicitly queued for immediate cleanup (currently none for
+    // successful /invoice requests — see FIX #9 above).
     for (const p of tempPaths) _safeUnlink(p);
   }
 });

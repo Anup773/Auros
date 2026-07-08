@@ -25,6 +25,37 @@
  * [AUDIT #3] In-memory locks → engine must use Redis Redlock.
  * [AUDIT #17] Distributed persistence → entire backend concern.
  * These are documented here but cannot be solved in the controller alone.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * V3 PATCH (applied by Claude — see chat for full explanation):
+ *
+ *   FIX V3-A — Missing `await` on every engine.* call in this file.
+ *     Every exported function in reconciliationEngine.service.js
+ *     (getJob, listJobs, approveItem, rejectItem, bulkApprove,
+ *     lockApprovalItem, renewLock, releaseLock, executeReconciliation) is
+ *     declared `async` and therefore returns a Promise. This controller was
+ *     calling almost all of them WITHOUT `await` (only startReconciliation
+ *     and the main call inside executeReconciliation were correctly
+ *     awaited). Concretely:
+ *       - `getJob` compared `job.userId !== req.user.id` where `job` was a
+ *         Promise object — `.userId` is undefined on a Promise, so this was
+ *         ALWAYS true, meaning GET /api/procurement/:jobId always returned
+ *         403 Forbidden, regardless of whether the job existed or who owned
+ *         it. This is the endpoint the frontend polls after starting a
+ *         reconciliation, so this alone could fully explain a stuck spinner.
+ *       - `_assertJobOwner` had the exact same bug (`engine.getJob(jobId)`
+ *         unawaited), and is called by lockItem, releaseLock, renewLock,
+ *         approveItem, rejectItem, bulkApprove, executeReconciliation,
+ *         getSchema, and downloadOutput — so ALL of those 403'd too, before
+ *         doing anything else.
+ *       - `listJobs` returned `{ jobs: {} }` (an empty Promise-shaped object)
+ *         on every call instead of the real array.
+ *     Fix: every controller function that calls an engine.* function (or
+ *     _assertJobOwner) is now declared `async` and every such call is
+ *     `await`ed. _assertJobOwner itself is now `async` and awaits
+ *     engine.getJob(). No route paths, status codes, response shapes, or
+ *     business logic were changed — only the missing awaits were added.
+ * ────────────────────────────────────────────────────────────────────────────
  */
 
 const path   = require('path');
@@ -35,9 +66,9 @@ const audit  = require('../audit/auditLogger.service');
 const MAX_BULK_APPROVALS = 500;
 
 // ── List jobs ────────────────────────────────────────────────────────────────
-exports.listJobs = (req, res, next) => {
+exports.listJobs = async (req, res, next) => {
   try {
-    const jobs = engine.listJobs(req.user.id);
+    const jobs = await engine.listJobs(req.user.id);
     res.json({ jobs });
   } catch (err) {
     next(err);
@@ -93,9 +124,9 @@ exports.startReconciliation = async (req, res, next) => {
 };
 
 // ── Get job ──────────────────────────────────────────────────────────────────
-exports.getJob = (req, res, next) => {
+exports.getJob = async (req, res, next) => {
   try {
-    const job = engine.getJob(req.params.jobId);
+    const job = await engine.getJob(req.params.jobId);
     if (!job) {
       return res.status(404).json({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
     }
@@ -113,13 +144,13 @@ exports.getJob = (req, res, next) => {
 // Prevents another reviewer grabbing the same item simultaneously.
 // NOTE [AUDIT #3]: locks must be backed by Redis Redlock in the engine,
 // not an in-memory Map, for this to survive pod restarts and horizontal scaling.
-exports.lockItem = (req, res, next) => {
+exports.lockItem = async (req, res, next) => {
   try {
     const { jobId, approvalId } = req.params;
-    _assertJobOwner(jobId, req);
+    await _assertJobOwner(jobId, req);
 
     // [AUDIT #2] userId forwarded — engine must re-validate atomically.
-    const result = engine.lockApprovalItem(jobId, approvalId, req.user.id);
+    const result = await engine.lockApprovalItem(jobId, approvalId, req.user.id);
     if (!result.acquired) {
       return res.status(409).json({
         error    : result.reason,
@@ -134,11 +165,11 @@ exports.lockItem = (req, res, next) => {
 };
 
 // ── Release lock (user closed review panel without deciding) ─────────────────
-exports.releaseLock = (req, res, next) => {
+exports.releaseLock = async (req, res, next) => {
   try {
     const { jobId, approvalId } = req.params;
-    _assertJobOwner(jobId, req);
-    engine.releaseLock(jobId, approvalId, req.user.id);
+    await _assertJobOwner(jobId, req);
+    await engine.releaseLock(jobId, approvalId, req.user.id);
     res.json({ released: true, approvalId });
   } catch (err) {
     next(err);
@@ -150,14 +181,14 @@ exports.releaseLock = (req, res, next) => {
 // from expiring while the reviewer is still working on the item.
 // NOTE [AUDIT #3]: effective only once engine.renewLock() is backed by
 // Redis Redlock — in-memory locks don't expire so renewal is a no-op there.
-exports.renewLock = (req, res, next) => {
+exports.renewLock = async (req, res, next) => {
   try {
     const { jobId, approvalId } = req.params;
-    _assertJobOwner(jobId, req);
+    await _assertJobOwner(jobId, req);
 
     // [AUDIT #2] userId forwarded — engine must verify the caller still holds
     // the lock before extending it (prevents a different user from renewing).
-    const result = engine.renewLock(jobId, approvalId, req.user.id);
+    const result = await engine.renewLock(jobId, approvalId, req.user.id);
 
     res.json({
       success    : true,
@@ -170,7 +201,7 @@ exports.renewLock = (req, res, next) => {
 };
 
 // ── Approve item ─────────────────────────────────────────────────────────────
-exports.approveItem = (req, res, next) => {
+exports.approveItem = async (req, res, next) => {
   try {
     const { jobId, approvalId } = req.params;
     const { response, respondedVia } = req.body;
@@ -179,12 +210,12 @@ exports.approveItem = (req, res, next) => {
       return res.status(400).json({ error: 'response is required', code: 'MISSING_FIELD' });
     }
 
-    _assertJobOwner(jobId, req);
+    await _assertJobOwner(jobId, req);
 
     // [AUDIT #2] userId forwarded — engine must re-validate ownership atomically.
-    engine.approveItem(jobId, approvalId, response, respondedVia || 'dashboard', req.user.id);
+    await engine.approveItem(jobId, approvalId, response, respondedVia || 'dashboard', req.user.id);
 
-    const updated = engine.getJob(jobId);
+    const updated = await engine.getJob(jobId);
     res.json({ success: true, job: updated });
   } catch (err) {
     // 409 conflict (already resolved or lock conflict) → pass through
@@ -193,17 +224,17 @@ exports.approveItem = (req, res, next) => {
 };
 
 // ── Reject item ──────────────────────────────────────────────────────────────
-exports.rejectItem = (req, res, next) => {
+exports.rejectItem = async (req, res, next) => {
   try {
     const { jobId, approvalId } = req.params;
     const { reason } = req.body;
 
-    _assertJobOwner(jobId, req);
+    await _assertJobOwner(jobId, req);
 
     // [AUDIT #2] userId forwarded — engine must re-validate ownership atomically.
-    engine.rejectItem(jobId, approvalId, reason || 'Rejected by user', req.user.id);
+    await engine.rejectItem(jobId, approvalId, reason || 'Rejected by user', req.user.id);
 
-    const updated = engine.getJob(jobId);
+    const updated = await engine.getJob(jobId);
     res.json({ success: true, job: updated });
   } catch (err) {
     next(err);
@@ -213,7 +244,7 @@ exports.rejectItem = (req, res, next) => {
 // ── Bulk approve ─────────────────────────────────────────────────────────────
 // Apply same response to multiple approval items at once.
 // [AUDIT #4] Hard-capped at MAX_BULK_APPROVALS (500) per call — enforced here.
-exports.bulkApprove = (req, res, next) => {
+exports.bulkApprove = async (req, res, next) => {
   try {
     const { jobId } = req.params;
     const { approvalIds, response, respondedVia } = req.body;
@@ -235,10 +266,10 @@ exports.bulkApprove = (req, res, next) => {
       });
     }
 
-    _assertJobOwner(jobId, req);
+    await _assertJobOwner(jobId, req);
 
     // [AUDIT #2] userId forwarded — engine must re-validate ownership atomically.
-    const result = engine.bulkApprove(
+    const result = await engine.bulkApprove(
       jobId,
       approvalIds,
       response,
@@ -262,7 +293,7 @@ exports.bulkApprove = (req, res, next) => {
 exports.executeReconciliation = async (req, res, next) => {
   try {
     const { jobId } = req.params;
-    _assertJobOwner(jobId, req);
+    await _assertJobOwner(jobId, req);
     const result = await engine.executeReconciliation(jobId);
     res.json({ success: true, ...result });
   } catch (err) {
@@ -271,10 +302,10 @@ exports.executeReconciliation = async (req, res, next) => {
 };
 
 // ── Audit trail ──────────────────────────────────────────────────────────────
-exports.getAuditTrail = (req, res, next) => {
+exports.getAuditTrail = async (req, res, next) => {
   try {
     const { jobId } = req.params;
-    _assertJobOwner(jobId, req);
+    await _assertJobOwner(jobId, req);
 
     const format = req.query.format || 'json';
 
@@ -298,9 +329,9 @@ exports.getAuditTrail = (req, res, next) => {
 exports.getSchema = async (req, res, next) => {
   try {
     const { jobId } = req.params;
-    _assertJobOwner(jobId, req);
+    await _assertJobOwner(jobId, req);
 
-    const job = engine.getJob(jobId);
+    const job = await engine.getJob(jobId);
     if (!job) return res.status(404).json({ error: 'Job not found' });
 
     const { detectSchema, formatSchemaForUI } = require('../ingestion/schemaDetector.service');
@@ -316,12 +347,12 @@ exports.getSchema = async (req, res, next) => {
 };
 
 // ── Download output ──────────────────────────────────────────────────────────
-exports.downloadOutput = (req, res, next) => {
+exports.downloadOutput = async (req, res, next) => {
   try {
     const { jobId } = req.params;
-    _assertJobOwner(jobId, req);
+    await _assertJobOwner(jobId, req);
 
-    const job = engine.getJob(jobId);
+    const job = await engine.getJob(jobId);
     if (!job || !job.outputPath) {
       return res.status(404).json({ error: 'Output not ready yet', code: 'OUTPUT_NOT_READY' });
     }
@@ -333,8 +364,8 @@ exports.downloadOutput = (req, res, next) => {
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-function _assertJobOwner(jobId, req) {
-  const job = engine.getJob(jobId);
+async function _assertJobOwner(jobId, req) {
+  const job = await engine.getJob(jobId);
   if (!job) {
     const err = new Error('Job not found');
     err.status = 404;

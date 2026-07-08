@@ -46,6 +46,28 @@
  *     Previous: both job complete handler AND failed event handler wrote results.
  *     A race condition could overwrite 'completed' with 'failed'.
  *     Fix: Failed handler only writes if no completed result already exists.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * V3 PATCH (applied by Claude — see chat for full explanation):
+ *
+ *   FIX V3-A — Worker never published to the pub/sub "done" channel.
+ *     reconciliationEngine.service.js's _waitForResult() subscribes to
+ *     `auros:job:done:<bullJobId>` expecting an instant notification when a
+ *     job finishes. This file wrote the result to `bull:result:<bullJobId>`
+ *     via writeResult() but never called `.publish(...)` on that channel —
+ *     the string "publish" did not appear anywhere in this file. So the
+ *     "instant" path never fired, and every job depended entirely on the
+ *     30-second fallback poll on the engine side (and, combined with a
+ *     separate bug over there, could get stuck indefinitely).
+ *     Fix: writeResult() now publishes to `auros:job:done:<bullJobId>`
+ *     immediately after a successful Redis SET, but only for terminal
+ *     states ('completed' or 'failed') — never for the interim 'processing'
+ *     marker. This is a single choke point, so it automatically covers all
+ *     five job types (ocr, parse, reconcile, zip, voice) without touching
+ *     each handler individually. Publishing is wrapped in its own try/catch
+ *     and is non-fatal: if it fails, the engine's fallback poll still finds
+ *     the result via Redis as before, just up to PUBSUB_FALLBACK_MS later.
+ * ────────────────────────────────────────────────────────────────────────────
  */
 
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
@@ -89,6 +111,9 @@ _redis.connect().catch(err => {
 
 const REDIS_RESULT_PREFIX = 'bull:result:';
 const REDIS_RESULT_TTL_S  = parseInt(process.env.RESULT_TTL_HOURS || '24', 10) * 3600;  // FIX: 24h default (was 4h)
+
+// V3 FIX: must match JOB_DONE_CHANNEL_PREFIX in reconciliationEngine.service.js
+const JOB_DONE_CHANNEL_PREFIX = 'auros:job:done:'; // + bullJobId
 
 // FIX 4: writeResult with retry
 async function writeResult(bullJobId, status, resultOrError) {
@@ -134,6 +159,23 @@ async function writeResult(bullJobId, status, resultOrError) {
     try {
       await _redis.set(key, JSON.stringify(entry), 'EX', REDIS_RESULT_TTL_S);
       console.log(`[worker] Wrote ${status} result to Redis: ${key}`);
+
+      // V3 FIX: notify any waiting reconciliationEngine._waitForResult()
+      // subscriber immediately on terminal states only ('completed'/'failed'
+      // — never for the interim 'processing' marker, since that isn't done
+      // yet). This used to never happen at all, so every job depended
+      // entirely on the engine's 30s fallback poll. Publishing with zero
+      // subscribers is a harmless no-op in Redis, and a publish failure here
+      // is non-fatal — the fallback poll on the engine side will still find
+      // the result in Redis regardless.
+      if (status === 'completed' || status === 'failed') {
+        try {
+          await _redis.publish(`${JOB_DONE_CHANNEL_PREFIX}${bullJobId}`, status);
+          console.log(`[worker] Published ${status} notification on ${JOB_DONE_CHANNEL_PREFIX}${bullJobId}`);
+        } catch (pubErr) {
+          console.warn(`[worker] Failed to publish job:done for ${bullJobId} (non-fatal — engine fallback poll will still find it):`, pubErr.message);
+        }
+      }
       return;
     } catch (err) {
       if (attempt < 2) {
@@ -410,3 +452,4 @@ process.on('unhandledRejection', (reason) => {
 });
 
 function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+

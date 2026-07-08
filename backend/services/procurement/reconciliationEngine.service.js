@@ -29,6 +29,30 @@
  *
  *   All other V5 logic is preserved exactly (Redis-backed job store, pub/sub
  *   subscription, GETDEL, lock heartbeat, bulk approve atomicity, etc.).
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * V7 PATCH (applied by Claude — see chat for full explanation):
+ *
+ *   FIX V7-A — _waitForResult()/_consumeResult() double-consume bug.
+ *     The fallback timer's own inline GETDEL and the subsequent call to
+ *     _consumeResult() (which does ANOTHER GETDEL on the same key) raced
+ *     against each other: whichever ran second always found the key already
+ *     deleted, so it silently treated a real "processing" marker exactly the
+ *     same as a genuinely missing result. Worse, _cleanup() ran unconditionally
+ *     after that second call, permanently cancelling the watcher — so if the
+ *     fallback fired while the worker had only written its initial
+ *     `{status:'processing'}` marker (which happens on almost every job,
+ *     since the worker writes that marker within milliseconds of starting),
+ *     the job would be abandoned mid-flight and never updated again, even
+ *     though the worker was still correctly running and would later write the
+ *     real "completed" result.
+ *     Fix: the Redis read now happens exactly once per fallback tick (via the
+ *     new _readResultKey() helper), and the parsed entry is handed to the new
+ *     _processResultEntry(), which returns whether the outcome was terminal
+ *     (completed/failed → true) or not (an interim "processing" marker →
+ *     false). Cleanup only happens on a terminal outcome; a non-terminal
+ *     outcome re-arms the fallback timer instead of abandoning the job.
+ * ────────────────────────────────────────────────────────────────────────────
  */
 
 const path   = require('path');
@@ -420,10 +444,27 @@ function _waitForResult(jobId, bullJobId) {
   let   cancelled  = false;
   let   fallbackId = null;
 
+  // V7 FIX: onMessage now does exactly ONE read of the result key (via
+  // _readResultKey) and hands the raw value to _processResultEntry(), which
+  // reports whether the outcome was terminal. Previously this called
+  // _consumeResult() (its own separate GETDEL) and then _cleanup()
+  // unconditionally — so if the pub/sub message happened to reference a key
+  // that had already been drained by a concurrent fallback tick, the watcher
+  // was torn down having done nothing, even though the job might still be
+  // running. Now a non-terminal read just leaves the existing fallback timer
+  // in place instead of tearing anything down.
   const onMessage = async (chan, message) => {
     if (chan !== channel || cancelled) return;
-    await _consumeResult(jobId, resultKey, bullJobId);
-    _cleanup();
+    const raw = await _readResultKey(resultKey);
+    if (!raw) {
+      // Message arrived but the key was empty/already drained — rely on the
+      // fallback timer (still armed) to pick up the eventual result.
+      console.log(`[reconciliationEngine] Pub/sub notified for ${jobId} but result key was empty — fallback timer will keep checking`);
+      return;
+    }
+    const terminal = await _processResultEntry(jobId, raw);
+    if (terminal) _cleanup();
+    // else: interim "processing" marker — keep the fallback timer running.
   };
 
   _subRedis.subscribe(channel).catch(err => {
@@ -433,11 +474,12 @@ function _waitForResult(jobId, bullJobId) {
   _subRedis.on('message', onMessage);
 
   // _scheduleNextFallback — (re)arms the fallback timer.
-  // Called once at startup and again whenever _consumeResult finds an empty
-  // Redis key (meaning the worker is still running and hasn't written its
-  // result yet). This keeps checking every PUBSUB_FALLBACK_MS until either:
+  // Called once at startup and again whenever the result key is empty OR
+  // holds only an interim "processing" marker (worker still running). This
+  // keeps checking every PUBSUB_FALLBACK_MS until either:
   //   (a) the pub/sub message arrives (fast path — timer cancelled), or
-  //   (b) the result key appears in Redis (slow path — picked up on retry), or
+  //   (b) the result key holds a terminal completed/failed entry (slow path —
+  //       picked up on a retry and applied), or
   //   (c) the job age exceeds RECONCILE_TIMEOUT (marked as error).
   function _scheduleNextFallback() {
     if (cancelled) return;
@@ -445,15 +487,9 @@ function _waitForResult(jobId, bullJobId) {
       if (cancelled) return;
       console.warn(`[reconciliationEngine] PubSub fallback fired for ${jobId} after ${PUBSUB_FALLBACK_MS}ms — checking Redis`);
 
-      // Check if result is now in Redis
-      let raw;
-      try {
-        raw = _redisSupportsGetdel
-          ? await _redisClient.getdel(resultKey)
-          : await _redisClient.get(resultKey).then(async v => { if (v) await _redisClient.del(resultKey); return v; });
-      } catch (_) {
-        try { raw = await _redisClient.get(resultKey); } catch (_2) {}
-      }
+      // V7 FIX: single read via the shared helper — no second, redundant
+      // GETDEL later. Whatever we get here IS the value to act on.
+      const raw = await _readResultKey(resultKey);
 
       if (!raw) {
         // Result not ready yet — check job age
@@ -474,9 +510,21 @@ function _waitForResult(jobId, bullJobId) {
         return;
       }
 
-      // Result is ready — consume it
-      await _consumeResult(jobId, resultKey, bullJobId);
-      _cleanup();
+      // V7 FIX: process the value we already have in hand. If it's only the
+      // worker's interim {status:'processing'} marker (written within
+      // milliseconds of the job starting — see worker.js), this is NOT
+      // terminal, so we re-arm instead of abandoning the job. Previously this
+      // situation was indistinguishable from "no result at all" AND the
+      // watcher was torn down regardless, which is the root cause of jobs
+      // getting stuck forever in "processing" while the worker was still
+      // correctly running.
+      const terminal = await _processResultEntry(jobId, raw);
+      if (terminal) {
+        _cleanup();
+      } else {
+        console.log(`[reconciliationEngine] Job ${jobId} result key held an interim marker (worker still running) — will retry in ${PUBSUB_FALLBACK_MS}ms`);
+        _scheduleNextFallback();
+      }
     }, PUBSUB_FALLBACK_MS);
   }
 
@@ -501,70 +549,62 @@ function _waitForResult(jobId, bullJobId) {
   };
 }
 
-async function _consumeResult(jobId, resultKey, bullJobId) {
-  const job = await getJob(jobId);
-  if (!job || job.status !== 'processing') return;
-
-  let raw;
+// V7 FIX (NEW): performs exactly one destructive read of a result key and
+// returns the raw string (or null/undefined if absent). Extracted out of the
+// old _consumeResult() so callers never issue two GETDELs against the same
+// key for a single observed value.
+async function _readResultKey(resultKey) {
   try {
     // Use GETDEL only if Redis >= 6.2 (detected at startup).
     // On Redis 5.x (e.g. 5.0.14 on Windows), GETDEL returns
     // 'ERR unknown command' even though ioredis exposes the method.
     // _redisSupportsGetdel is set by version detection on the 'ready' event.
     if (_redisSupportsGetdel) {
-      raw = await _redisClient.getdel(resultKey);
-    } else {
-      raw = await _redisClient.get(resultKey);
-      if (raw) await _redisClient.del(resultKey);
+      return await _redisClient.getdel(resultKey);
     }
+    const v = await _redisClient.get(resultKey);
+    if (v) await _redisClient.del(resultKey);
+    return v;
   } catch (err) {
-    console.warn(`[reconciliationEngine] Redis read error for ${jobId}:`, err.message);
+    console.warn(`[reconciliationEngine] Redis read error on ${resultKey}:`, err.message);
     // Last-resort plain GET
     try {
-      raw = await _redisClient.get(resultKey);
-      if (raw) await _redisClient.del(resultKey).catch(() => {});
+      const v = await _redisClient.get(resultKey);
+      if (v) await _redisClient.del(resultKey).catch(() => {});
+      return v;
     } catch (err2) {
-      console.warn(`[reconciliationEngine] Redis GET fallback also failed for ${jobId}:`, err2.message);
-      return;
+      console.warn(`[reconciliationEngine] Redis GET fallback also failed for ${resultKey}:`, err2.message);
+      return null;
     }
   }
+}
 
-  if (!raw) {
-    // Result not in Redis yet — job may still be processing (fallback fired early)
-    // Mark as error only if the job has been processing for an unusually long time
-    const jobAge = Date.now() - new Date(job.createdAt).getTime();
-    if (jobAge > RECONCILE_TIMEOUT) {
-      await _updateJob(jobId, {
-        status: 'error',
-        error : 'Worker result not found in Redis. The worker may have crashed or timed out.',
-      });
-    } else {
-      console.log(`[reconciliationEngine] Fallback fired early for ${jobId} (age: ${Math.round(jobAge/1000)}s) — result not yet in Redis, will retry via next poll`);
-      // Re-arm the fallback for another 30s so we keep checking
-      // The frontend can also poll /api/procurement/:jobId directly
-    }
-    return;
-  }
+// V7 FIX (renamed/refactored from _consumeResult): takes an ALREADY-FETCHED
+// raw Redis value (never re-reads Redis itself) and applies it to the job.
+// Returns true if the outcome was terminal (completed/failed — the caller
+// should stop watching) or false if it was only the worker's interim
+// "processing" marker (the caller should keep watching / re-arm).
+async function _processResultEntry(jobId, raw) {
+  const job = await getJob(jobId);
+  if (!job || job.status !== 'processing') return true; // already resolved elsewhere — stop watching
 
   let entry;
   try {
     entry = JSON.parse(raw);
   } catch {
     await _updateJob(jobId, { status: 'error', error: 'Worker returned invalid JSON.' });
-    return;
+    return true;
   }
 
   if (entry.status === 'completed') {
     // FIX: Worker stores large results (>100KB) on disk and puts only the
     // file path in Redis as entry.resultFile. Small results are inline as
     // entry.result. We must handle BOTH cases.
-    // Your Accounts-Payable.xlsx produced a 1001KB result — always hits disk path.
     let workerResult = entry.result;
 
     if (!workerResult && entry.resultFile) {
       // Large result — read from disk
       try {
-        const fs = require('fs');
         const fileContent = fs.readFileSync(entry.resultFile, 'utf8');
         workerResult = JSON.parse(fileContent);
         console.log(`[reconciliationEngine] Loaded large result from disk for ${jobId}: ${entry.resultFile}`);
@@ -576,7 +616,7 @@ async function _consumeResult(jobId, resultKey, bullJobId) {
           status: 'error',
           error : `Could not read worker result file: ${diskErr.message}`,
         });
-        return;
+        return true;
       }
     }
 
@@ -585,21 +625,27 @@ async function _consumeResult(jobId, resultKey, bullJobId) {
         status: 'error',
         error : 'Worker marked job completed but result is empty (no inline result and no resultFile).',
       });
-      return;
+      return true;
     }
 
     const schemaError = _validateWorkerResult(workerResult);
     if (schemaError) {
       await _updateJob(jobId, { status: 'error', error: `Worker result schema invalid: ${schemaError}` });
-      return;
+      return true;
     }
     await _applyReconcileResult(jobId, workerResult);
+    return true;
 
   } else if (entry.status === 'failed') {
     console.error(`[reconciliationEngine] Worker failure for ${jobId}: ${entry.error}`);
     await _updateJob(jobId, { status: 'error', error: entry.error || 'Worker failed' });
+    return true;
   }
-  // status === 'processing' — result written but job still running
+
+  // entry.status === 'processing' — this is just the worker's interim
+  // marker, written the moment the job starts (see worker.js writeResult()).
+  // Not terminal — caller must keep watching.
+  return false;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

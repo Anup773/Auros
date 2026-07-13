@@ -54,6 +54,7 @@ const rateLimit = require('express-rate-limit');
 
 const { requireAuth }               = require('../controllers/auth.controller');
 const { requireReviewer, requireFinance } = require('../middleware/rbac');
+const { validate, schemas }         = require('../middleware/validate');
 const ctrl = require('../controllers/procurement.controller');
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -102,7 +103,7 @@ const _bulkLimiter = rateLimit({
 router.get('/', requireAuth, ctrl.listJobs);
 
 // ── Start reconciliation ──────────────────────────────────────────────────────
-router.post('/reconcile', requireAuth, requireFinance, ctrl.startReconciliation);
+router.post('/reconcile', requireAuth, requireFinance, validate(schemas.startReconciliation), ctrl.startReconciliation);
 
 // ── Get job ───────────────────────────────────────────────────────────────────
 router.get('/:jobId', requireAuth, ctrl.getJob);

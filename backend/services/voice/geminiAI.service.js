@@ -311,6 +311,117 @@ async function explainItem(ambiguity, question) {
   }
 }
 
+// ── 4. FREE-FORM DATASET Q&A (Batch 2) ────────────────────────────────────────
+/**
+ * Answer an informational question about the current reconciliation job
+ * ("which vendor has the most unmatched invoices?", "what's our total
+ * flagged amount?") — as opposed to interpretCommand() above, which maps
+ * text to an action to EXECUTE.
+ *
+ * Scale note: this does NOT hand Gemini the raw ambiguities array. With
+ * 10k+ items that would blow the prompt token budget and get slower/more
+ * expensive as jobs grow. Instead we compute a compact aggregate summary
+ * in JS first (single O(n) pass — see _buildAggregateSummary) and only
+ * send Gemini the aggregated numbers. Gemini reasons over pre-computed
+ * stats, not raw rows, so answer quality doesn't degrade as data grows
+ * and the prompt size stays roughly constant regardless of job size.
+ *
+ * Security note: this function ALWAYS returns { answer, isAnswer: true }
+ * and NEVER an actions array, regardless of what Gemini's response
+ * contains. A "question" can never be turned into an approval/reject/hold
+ * action through this path, even via prompt injection in the user's text —
+ * that's enforced here structurally, not just by prompting Gemini nicely.
+ */
+async function answerDatasetQuestion(question, ambiguities = []) {
+  if (!isConfigured()) {
+    throw Object.assign(
+      new Error('Gemini fallback is not configured (GEMINI_API_KEY missing).'),
+      { status: 503, code: 'GEMINI_NOT_CONFIGURED' }
+    );
+  }
+
+  const genAI = getClient();
+  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+  const summary  = _buildAggregateSummary(ambiguities);
+  const safeQ    = _sanitizeUserText(question);
+
+  const prompt = `You are a procurement reconciliation assistant. Answer the user's question using ONLY the aggregate data below. Do not invent numbers or vendors that are not listed. If the data does not contain enough information to answer, say so plainly instead of guessing.
+
+AGGREGATE SUMMARY OF CURRENT RECONCILIATION JOB:
+${summary}
+
+USER QUESTION: "${safeQ}"
+
+Answer in 1-3 plain sentences. No markdown, no preamble, just the answer.`;
+
+  try {
+    const result = await _withTimeout(
+      model.generateContent(prompt),
+      GEMINI_TIMEOUT_MS,
+      'answerDatasetQuestion'
+    );
+    const answer = result.response.text().trim();
+
+    // Structural guarantee: this path never returns actions, no matter
+    // what Gemini said. Q&A is read-only.
+    return { answer: answer || "I couldn't find an answer in the current data.", isAnswer: true };
+
+  } catch (err) {
+    if (_isRateLimitError(err)) {
+      throw Object.assign(
+        new Error('Gemini API quota exceeded. Please try again shortly.'),
+        { status: 429, code: 'GEMINI_QUOTA_EXCEEDED' }
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * Compute an aggregate, non-PII-heavy summary in a single O(n) pass.
+ * Caps vendor list at top 10 by flagged count so the prompt size stays
+ * bounded even for very large jobs (this is a scale safeguard, not a
+ * display limit — the full counts are still accurate, just the per-vendor
+ * breakdown is truncated to the top offenders).
+ */
+function _buildAggregateSummary(ambiguities) {
+  if (!ambiguities || ambiguities.length === 0) return 'No reconciliation items in this job.';
+
+  const byType     = {};
+  const bySeverity = {};
+  const byVendor   = {};
+  let totalFlaggedAmount = 0;
+  let answeredCount      = 0;
+
+  for (const amb of ambiguities) {
+    const type     = amb.type || 'unknown';
+    const severity = amb.severity || 'unspecified';
+    const vendor   = amb.invoice?.vendor_name || 'Unknown Vendor';
+    const amount   = parseFloat(amb.invoice?.amount) || 0;
+
+    byType[type]         = (byType[type] || 0) + 1;
+    bySeverity[severity] = (bySeverity[severity] || 0) + 1;
+    byVendor[vendor]     = (byVendor[vendor] || 0) + 1;
+    totalFlaggedAmount  += amount;
+    if (amb.answered) answeredCount++;
+  }
+
+  const topVendors = Object.entries(byVendor)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([v, c]) => `${v}: ${c}`)
+    .join(', ');
+
+  return [
+    `Total items: ${ambiguities.length} (${answeredCount} already answered, ${ambiguities.length - answeredCount} pending)`,
+    `By issue type: ${Object.entries(byType).map(([t, c]) => `${t}=${c}`).join(', ')}`,
+    `By severity: ${Object.entries(bySeverity).map(([s, c]) => `${s}=${c}`).join(', ')}`,
+    `Total flagged amount (sum of all listed invoice amounts, mixed currencies not converted): ${totalFlaggedAmount.toFixed(2)}`,
+    `Top vendors by flagged-item count: ${topVendors || 'none'}`,
+  ].join('\n');
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function _buildDataSummary(ambiguities) {
   if (!ambiguities || ambiguities.length === 0) return 'No items available';
@@ -332,5 +443,4 @@ function _buildDataSummary(ambiguities) {
   }).join('\n');
 }
 
-module.exports = { transcribeAudio, interpretCommand, explainItem, isConfigured };
-
+module.exports = { transcribeAudio, interpretCommand, explainItem, answerDatasetQuestion, isConfigured };

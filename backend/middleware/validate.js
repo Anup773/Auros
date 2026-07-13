@@ -35,8 +35,17 @@ const schemas = {
 
   // Procurement
   startReconciliation: z.object({
-    invoiceDatasetId: z.string().min(1).max(100),
-    poDatasetId     : z.string().max(100).optional(),
+    invoiceDatasetId : z.string().min(1).max(100),
+    // BUGFIX (regression from Batch 3): .optional() alone only accepts
+    // `undefined`, not `null`. The frontend's React state defaults these
+    // to `null` when a file hasn't been uploaded, and JSON.stringify keeps
+    // `null` keys (it only drops `undefined` ones) — so this validation
+    // was rejecting EVERY reconciliation request the moment it was wired
+    // in, regardless of which files were actually uploaded. .nullable()
+    // accepts both null and undefined.
+    poDatasetId      : z.string().max(100).nullable().optional(),
+    grnDatasetId     : z.string().max(100).nullable().optional(),
+    contractDatasetId: z.string().max(100).nullable().optional(),
   }),
 
   approveItem: z.object({

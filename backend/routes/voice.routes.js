@@ -77,7 +77,16 @@ const withCommandLimit = commandRateLimit ? [commandRateLimit] : [];
 // ── Multer: memory storage ────────────────────────────────────────────────────
 const upload = multer({
   storage   : multer.memoryStorage(),
-  limits    : { fileSize: 25 * 1024 * 1024 },
+  // BUGFIX: fieldSize was never set here, so multer used its default 1MB
+  // limit for the `ambiguities` form field. express.json() elsewhere in
+  // this app (app.js) allows 10MB for the exact same payload when sent as
+  // JSON (text commands). On a job with thousands of items, the serialised
+  // ambiguities array can exceed 1MB but comfortably fits under 10MB —
+  // which is exactly why voice commands failed on large jobs ("Failed to
+  // fetch" — the connection gets aborted mid-upload once the field limit is
+  // hit) while text commands on the same job worked fine. Matched to the
+  // same 10MB bound used for JSON bodies for consistency.
+  limits    : { fileSize: 25 * 1024 * 1024, fieldSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (file.mimetype.startsWith('audio/')) {
       cb(null, true);
@@ -254,6 +263,17 @@ router.use((err, req, res, next) => {
   if (err.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({ error: 'Audio file exceeds 25MB limit', code: 'FILE_TOO_LARGE' });
   }
+  // BUGFIX: this case was previously unhandled and fell through to next(err)
+  // — which, depending on timing, could abort the connection mid-upload
+  // before the client ever received a response body, surfacing to the
+  // browser as a generic "Failed to fetch" network error instead of a
+  // readable message. Handled explicitly now.
+  if (err.code === 'LIMIT_FIELD_VALUE') {
+    return res.status(413).json({
+      error: 'Reconciliation job is too large for a voice command on this job size. Please use text commands instead.',
+      code : 'AMBIGUITIES_TOO_LARGE',
+    });
+  }
   if (err.code === 'INVALID_AUDIO_TYPE') {
     return res.status(400).json({ error: err.message, code: 'INVALID_AUDIO_TYPE' });
   }
@@ -261,4 +281,3 @@ router.use((err, req, res, next) => {
 });
 
 module.exports = router;
-

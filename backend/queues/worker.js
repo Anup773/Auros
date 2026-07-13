@@ -298,14 +298,14 @@ parseWorker.on('failed', async (job, err) => {
 const reconcileWorker = new Worker(
   'reconcile',
   async (job) => {
-    const { invoicePath, poPath } = job.data;
+    const { invoicePath, poPath, grnPath, contractPath } = job.data;
     console.log(`[worker:reconcile] Job ${job.id} — ${path.basename(invoicePath)}`);
     await writeResult(job.id, 'processing', null);
     await job.updateProgress(10);
 
     try {
       const result = await callEngine(
-        { operation: 'reconcile', invoicePath, poPath },
+        { operation: 'reconcile', invoicePath, poPath, grnPath, contractPath },
         { timeout: TIMEOUTS.reconcile }
       );
       await job.updateProgress(100);
@@ -452,4 +452,3 @@ process.on('unhandledRejection', (reason) => {
 });
 
 function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-

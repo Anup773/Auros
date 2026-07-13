@@ -266,9 +266,13 @@ export const procurementAPI = {
   // FIX 1: startReconciliation queues the job and returns 202 almost
   // immediately — but give it 660s in case Redis is slow or the sync
   // fallback path runs (which blocks until Python finishes).
-  startReconciliation: (invoiceDatasetId, poDatasetId, token) =>
+  // Batch 3: grnDatasetId/contractDatasetId are optional and appended at
+  // the end — existing 3-arg callers (invoiceDatasetId, poDatasetId, token)
+  // keep working unchanged; they just become `undefined`, which the backend
+  // already treats as "not supplied."
+  startReconciliation: (invoiceDatasetId, poDatasetId, token, grnDatasetId, contractDatasetId) =>
     request('POST', '/api/procurement/reconcile',
-      { invoiceDatasetId, poDatasetId },
+      { invoiceDatasetId, poDatasetId, grnDatasetId, contractDatasetId },
       token, false,
       { timeoutMs: RECONCILE_TIMEOUT_MS }
     ),

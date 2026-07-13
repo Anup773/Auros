@@ -121,6 +121,23 @@ CHUNK_ROWS                = 50_000
 FUZZY_VENDOR_THRESHOLD    = 85
 AMOUNT_MISMATCH_PCT       = 0.02
 
+# ── Batch: currency / tax / priority ambiguity thresholds ────────────────────
+# Tolerance for the line-items-vs-total tax arithmetic check (Point 2).
+# Kept generous (2%) because OCR-extracted amounts carry rounding noise.
+TAX_DISCREPANCY_PCT   = float(os.environ.get('TAX_DISCREPANCY_PCT', '0.02'))
+# Dollar-value bands used to label question priority (Point 5). Configurable
+# per deployment since "high value" differs by company size — do NOT hardcode
+# assumptions about the customer's typical invoice size into the question text.
+PRIORITY_HIGH_AMOUNT   = float(os.environ.get('PRIORITY_HIGH_AMOUNT',   '10000'))
+PRIORITY_MEDIUM_AMOUNT = float(os.environ.get('PRIORITY_MEDIUM_AMOUNT', '1000'))
+
+# ── Batch 3: 3-way match (GRN) and contract-price-variance thresholds ────────
+# Both checks are OPT-IN: they only run when the caller actually supplies a
+# GRN dataset / contract dataset. No GRN or contract file uploaded = zero
+# behavior change, fully backward compatible with existing invoice+PO jobs.
+QUANTITY_MISMATCH_PCT       = float(os.environ.get('QUANTITY_MISMATCH_PCT', '0.05'))
+CONTRACT_PRICE_VARIANCE_PCT = float(os.environ.get('CONTRACT_PRICE_VARIANCE_PCT', '0.03'))
+
 SUPPORTED_EXTENSIONS = {'.csv', '.xlsx', '.xls', '.xml'}
 OCR_EXTENSIONS       = {'.pdf', '.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.webp'}
 DANGEROUS_EXTENSIONS = {
@@ -491,6 +508,10 @@ def op_reconcile(config: dict) -> dict:
     """
     invoice_path = _require(config, "invoicePath")
     po_path      = config.get("poPath")
+    # Batch 3: both optional, both fully backward compatible — omitting
+    # either (or both) reproduces the exact behavior from before this batch.
+    grn_path      = config.get("grnPath")
+    contract_path = config.get("contractPath")
 
     MAX_RECONCILE_ROWS = int(os.environ.get('MAX_RECONCILE_ROWS', '5000'))
 
@@ -557,21 +578,58 @@ def op_reconcile(config: dict) -> dict:
             f"Set MAX_RECONCILE_ROWS env var to increase."
         )
 
-    invoices = [_normalise_row(r) for r in invoices]
-    pos      = [_normalise_row(r) for r in pos]
+    # Batch 3: GRN (goods receipt) dataset — enables 3-way match (Point 1).
+    grn_rows     = []
+    grn_warnings = []
+    if grn_path and os.path.exists(grn_path):
+        grn_ext = Path(grn_path).suffix.lower()
+        if grn_ext == '.csv':
+            grn_rows, grn_warnings = parse_csv(grn_path, max_rows=MAX_RECONCILE_ROWS)
+        elif grn_ext in ('.xlsx', '.xls'):
+            grn_rows, grn_warnings = parse_xlsx(grn_path, max_rows=MAX_RECONCILE_ROWS)
+        else:
+            grn_warnings.append(
+                f"Unsupported GRN file type: {grn_ext}. "
+                "3-way match skipped. Supported: .csv, .xlsx, .xls"
+            )
+
+    # Batch 3: contract / rate-card dataset — enables price compliance (Point 3).
+    contract_rows     = []
+    contract_warnings = []
+    if contract_path and os.path.exists(contract_path):
+        contract_ext = Path(contract_path).suffix.lower()
+        if contract_ext == '.csv':
+            contract_rows, contract_warnings = parse_csv(contract_path, max_rows=MAX_RECONCILE_ROWS)
+        elif contract_ext in ('.xlsx', '.xls'):
+            contract_rows, contract_warnings = parse_xlsx(contract_path, max_rows=MAX_RECONCILE_ROWS)
+        else:
+            contract_warnings.append(
+                f"Unsupported contract file type: {contract_ext}. "
+                "Contract price compliance skipped. Supported: .csv, .xlsx, .xls"
+            )
+
+    invoices      = [_normalise_row(r) for r in invoices]
+    pos           = [_normalise_row(r) for r in pos]
+    grn_rows      = [_normalise_row(r) for r in grn_rows]
+    contract_rows = [_normalise_row(r) for r in contract_rows]
 
     for i, r in enumerate(invoices): r['_rowIndex'] = i
     for i, r in enumerate(pos):      r['_rowIndex'] = i
 
+    received_by_po = match_grn_to_pos(grn_rows) if grn_rows else {}
+    contract_index = build_contract_index(contract_rows) if contract_rows else {}
+
     matches    = match_invoices_to_pos(invoices, pos)
     duplicates = detect_invoice_duplicates(invoices)
-    recon      = build_reconciliation(invoices, matches, duplicates)
+    recon      = build_reconciliation(invoices, matches, duplicates, received_by_po, contract_index)
 
     return {
         "invoiceCount"  : len(invoices),
         "poCount"       : len(pos),
+        "grnCount"      : len(grn_rows),
+        "contractCount" : len(contract_rows),
         "reconciliation": recon,
-        "warnings"      : inv_warnings + po_warnings + trunc_warnings,
+        "warnings"      : inv_warnings + po_warnings + grn_warnings + contract_warnings + trunc_warnings,
     }
 
 
@@ -1155,29 +1213,41 @@ def _fuzzy_match_vendor(vendor_name: str, vendor_index: dict, all_pos: list):
 
 
 def match_invoices_to_pos(invoices: list, pos: list) -> list:
+    # BUGFIX: This function was matching on _get_invoice_number() for BOTH
+    # invoices and POs. PO rows do not have an "invoice_number" field — they
+    # have a "po_number" field. Since PO rows essentially never contain an
+    # invoice_number, po_by_number was always empty (or matched on garbage),
+    # so the exact-match path never fired. Every invoice fell through to
+    # fuzzy vendor-name matching (only available if rapidfuzz is installed)
+    # or went completely unmatched — which is why almost every invoice ended
+    # up flagged as "no_po_match", producing the same repetitive question
+    # for every uploaded file regardless of its actual content.
+    # Fix: match invoice.po_number against po.po_number (the correct field
+    # on both sides), matching the design already documented — but never
+    # wired up — in services/procurement/poMatcher.service.js.
     matches = []
     if not pos:
         return matches
 
     po_by_number: dict = {}
     for po in pos:
-        num = _get_invoice_number(po)
+        num = _get_po_number(po)
         if num:
             po_by_number[num.upper().strip()] = po
 
     vendor_index = _build_vendor_index(pos) if HAS_RAPIDFUZZ else {}
 
     for inv in invoices:
-        inv_num         = _get_invoice_number(inv)
+        inv_po_num      = _get_po_number(inv)
         inv_amount      = _parse_amount(inv)
         matched_po      = None
         match_type      = None
         amount_diff     = 0.0
         amount_diff_pct = 0.0
 
-        if inv_num and inv_num.upper().strip() in po_by_number:
-            matched_po = po_by_number[inv_num.upper().strip()]
-            match_type = "exact_invoice_number"
+        if inv_po_num and inv_po_num.upper().strip() in po_by_number:
+            matched_po = po_by_number[inv_po_num.upper().strip()]
+            match_type = "po_number"
         elif HAS_RAPIDFUZZ:
             vendor_name = _get_vendor_name(inv)
             if vendor_name:
@@ -1191,15 +1261,63 @@ def match_invoices_to_pos(invoices: list, pos: list) -> list:
                 amount_diff     = abs(inv_amount - po_amount)
                 amount_diff_pct = amount_diff / po_amount if po_amount else 0
 
+            # Point 4: compute currency comparison once, here, rather than
+            # re-deriving it in build_reconciliation. Kept O(1) per invoice.
+            currency_status = _currency_mismatch(_get_currency(inv), _get_currency(matched_po))
+
             matches.append({
-                "invoice"      : inv,
-                "po"           : matched_po,
-                "matchType"    : match_type,
-                "amountDiff"   : round(amount_diff, 2),
-                "amountDiffPct": round(amount_diff_pct, 4),
+                "invoice"       : inv,
+                "po"            : matched_po,
+                "matchType"     : match_type,
+                "amountDiff"    : round(amount_diff, 2),
+                "amountDiffPct" : round(amount_diff_pct, 4),
+                "currencyStatus": currency_status,   # 'ok' | 'unknown' | 'mismatch'
             })
 
     return matches
+
+
+def match_grn_to_pos(grn_rows: list) -> dict:
+    """
+    Batch 3 — Point 1 (3-way match). Sums received quantity per PO number
+    across all goods-receipt rows referencing that PO. O(n) single pass.
+    A PO can have multiple partial receipts, hence the sum rather than a
+    direct 1:1 lookup.
+
+    Returns {po_number_upper: total_quantity_received}. Empty dict if no
+    GRN rows are supplied — callers should treat that as "no GRN data was
+    uploaded for this job," not "zero units received everywhere."
+    """
+    received: dict = {}
+    for row in grn_rows:
+        po_num = _get_po_number(row)
+        qty    = _get_quantity(row)
+        if not po_num or qty is None:
+            continue
+        key = po_num.upper().strip()
+        received[key] = received.get(key, 0) + qty
+    return received
+
+
+def build_contract_index(contract_rows: list) -> dict:
+    """
+    Batch 3 — Point 3 (contract price compliance). Maps a normalised vendor
+    name to its contracted unit price. O(n) single pass.
+
+    If a vendor appears more than once (e.g. a rate card with multiple line
+    items), the LAST row wins — consistent with the "last write wins"
+    convention already used elsewhere in this file (e.g. po_by_number in
+    match_invoices_to_pos) rather than silently averaging or picking an
+    arbitrary one.
+    """
+    index: dict = {}
+    for row in contract_rows:
+        vendor = _get_vendor_name(row)
+        price  = _get_unit_price(row)
+        if not vendor or price is None:
+            continue
+        index[_normalize_vendor_for_index(vendor)] = price
+    return index
 
 
 def detect_invoice_duplicates(invoices: list) -> dict:
@@ -1225,24 +1343,33 @@ def detect_invoice_duplicates(invoices: list) -> dict:
     return {"count": count, "groups": groups}
 
 
-def build_reconciliation(invoices: list, matches: list, duplicates: dict) -> dict:
+def build_reconciliation(invoices: list, matches: list, duplicates: dict,
+                          received_by_po: dict = None, contract_index: dict = None) -> dict:
     matched     = []
     flagged     = []
     ambiguities = []
+
+    # Batch 3: default to empty dicts, not None, so downstream `if
+    # received_by_po and match:` checks below don't need extra None-guards.
+    received_by_po = received_by_po or {}
+    contract_index = contract_index or {}
 
     # FIX 2: O(1) match lookup — was O(n²) with next(m for m in matches if ...)
     match_lookup = {m["invoice"]["_rowIndex"]: m for m in matches}
 
     for inv in invoices:
         match = match_lookup.get(inv["_rowIndex"])
+        inv_amount = _parse_amount(inv)
 
         if not match:
-            flagged.append({"invoice": inv, "reason": "no_po_match", "severity": "High"})
+            severity = _priority_severity("High", inv_amount)
+            flagged.append({"invoice": inv, "reason": "no_po_match", "severity": severity})
             ambiguities.append({
                 "type"    : "no_po_match",
                 "invoice" : inv,
-                "severity": "High",
+                "severity": severity,
                 "question": (
+                    f"{_priority_label(inv_amount)}"
                     f"Invoice \"{_get_invoice_number(inv) or 'UNKNOWN'}\" "
                     f"from \"{_get_vendor_name(inv) or 'Unknown Vendor'}\" "
                     f"for {_fmt_amount(inv)} has no matching PO. "
@@ -1255,20 +1382,54 @@ def build_reconciliation(invoices: list, matches: list, duplicates: dict) -> dic
                     "Reject invoice",
                 ],
             })
+
+        # Point 4: currency mismatch is its own ambiguity, checked BEFORE
+        # amount comparison. Comparing amountDiffPct across two different
+        # currencies is meaningless (e.g. "1000 USD vs 1000 NPR" previously
+        # either silently matched or produced a nonsensical ~99% "amount
+        # mismatch" — neither told the user the real problem: wrong currency).
+        elif match["currencyStatus"] == "mismatch":
+            severity = _priority_severity("High", inv_amount)
+            flagged.append({
+                "invoice" : inv, "po": match["po"],
+                "reason"  : "currency_mismatch", "severity": severity,
+            })
+            ambiguities.append({
+                "type"    : "currency_mismatch",
+                "invoice" : inv,
+                "po"      : match["po"],
+                "severity": severity,
+                "question": (
+                    f"{_priority_label(inv_amount)}"
+                    f"Invoice \"{_get_invoice_number(inv) or 'UNKNOWN'}\" is in "
+                    f"{_get_currency(inv) or 'an unspecified currency'} but the matched "
+                    f"PO is in {_get_currency(match['po']) or 'a different currency'}. "
+                    f"Amounts cannot be reliably compared across currencies. "
+                    f"How should this be resolved?"
+                ),
+                "options": [
+                    "Approve — currencies confirmed correct",
+                    "Hold for currency verification",
+                    "Reject invoice",
+                ],
+            })
+
         elif match["amountDiffPct"] > AMOUNT_MISMATCH_PCT:
+            severity = _priority_severity("Medium", inv_amount)
             flagged.append({
                 "invoice" : inv,
                 "po"      : match["po"],
                 "reason"  : "amount_mismatch",
-                "severity": "Medium",
+                "severity": severity,
                 "diff"    : match["amountDiff"],
             })
             ambiguities.append({
                 "type"    : "amount_mismatch",
                 "invoice" : inv,
                 "po"      : match["po"],
-                "severity": "Medium",
+                "severity": severity,
                 "question": (
+                    f"{_priority_label(inv_amount)}"
                     f"Invoice \"{_get_invoice_number(inv) or 'UNKNOWN'}\" amount is "
                     f"{_fmt_amount(inv)} but PO amount is {_fmt_amount(match['po'])} — "
                     f"a difference of {_fmt_amount_val(match['amountDiff'])} "
@@ -1288,6 +1449,123 @@ def build_reconciliation(invoices: list, matches: list, duplicates: dict) -> dic
                 "po"       : match["po"],
                 "matchType": match["matchType"],
             })
+
+        # Point 2: tax-discrepancy check runs independently of PO-match
+        # status above — an invoice can simultaneously have no PO match AND
+        # a tax arithmetic problem, and both should surface as separate
+        # questions rather than one masking the other. Only fires when we
+        # actually have line-item data to check against (OCR-scanned
+        # invoices) — never fabricated from an assumed external tax rate.
+        has_discrepancy, expected_total = _tax_discrepancy(inv)
+        if has_discrepancy:
+            severity = _priority_severity("Medium", inv_amount)
+            ambiguities.append({
+                "type"    : "tax_discrepancy",
+                "invoice" : inv,
+                "severity": severity,
+                "question": (
+                    f"{_priority_label(inv_amount)}"
+                    f"Invoice \"{_get_invoice_number(inv) or 'UNKNOWN'}\" line items plus tax "
+                    f"add up to {_fmt_amount_val(expected_total, _get_currency(inv))}, "
+                    f"but the invoice total is {_fmt_amount(inv)}. "
+                    f"How should this discrepancy be resolved?"
+                ),
+                "options": [
+                    "Approve as stated",
+                    "Request corrected invoice from vendor",
+                    "Hold for review",
+                    "Reject invoice",
+                ],
+            })
+
+        # Point 1 (3-way match): only runs when a GRN dataset was actually
+        # uploaded (received_by_po non-empty) AND this invoice matched a PO
+        # AND both the invoice and the GRN carry a quantity we can compare.
+        # No GRN uploaded = zero behavior change from before this batch.
+        if received_by_po and match:
+            po_num  = _get_po_number(match["po"]).upper().strip()
+            inv_qty = _get_quantity(inv)
+            if po_num and inv_qty is not None:
+                if po_num not in received_by_po:
+                    severity = _priority_severity("Medium", inv_amount)
+                    ambiguities.append({
+                        "type"    : "no_goods_receipt",
+                        "invoice" : inv,
+                        "po"      : match["po"],
+                        "severity": severity,
+                        "question": (
+                            f"{_priority_label(inv_amount)}"
+                            f"Invoice \"{_get_invoice_number(inv) or 'UNKNOWN'}\" references PO "
+                            f"\"{po_num}\", but no goods receipt has been recorded against that "
+                            f"PO yet. How should this be handled?"
+                        ),
+                        "options": [
+                            "Approve — goods confirmed received",
+                            "Hold until goods receipt is recorded",
+                            "Reject invoice",
+                        ],
+                    })
+                else:
+                    received_qty = received_by_po[po_num]
+                    qty_diff_pct = (abs(inv_qty - received_qty) / received_qty) if received_qty else 0
+                    if qty_diff_pct > QUANTITY_MISMATCH_PCT:
+                        severity = _priority_severity("Medium", inv_amount)
+                        ambiguities.append({
+                            "type"    : "quantity_mismatch",
+                            "invoice" : inv,
+                            "po"      : match["po"],
+                            "severity": severity,
+                            "question": (
+                                f"{_priority_label(inv_amount)}"
+                                f"Invoice \"{_get_invoice_number(inv) or 'UNKNOWN'}\" bills for "
+                                f"{inv_qty:g} units, but {received_qty:g} units were recorded as "
+                                f"received against PO \"{po_num}\" "
+                                f"({round(qty_diff_pct * 100, 1)}% difference). "
+                                f"How should this be resolved?"
+                            ),
+                            "options": [
+                                "Approve as billed",
+                                "Approve for received quantity only",
+                                "Hold for review",
+                                "Reject invoice",
+                            ],
+                        })
+
+        # Point 3 (contract price compliance): only runs when a contract/
+        # rate-card dataset was uploaded AND this vendor has a contracted
+        # rate on file AND the invoice has enough data (quantity + amount)
+        # to derive an actual unit price to compare against it. We never
+        # invent a per-unit price from a total alone.
+        if contract_index:
+            vendor_key = _normalize_vendor_for_index(_get_vendor_name(inv))
+            inv_qty    = _get_quantity(inv)
+            if vendor_key and vendor_key in contract_index and inv_qty and inv_amount:
+                contracted_price  = contract_index[vendor_key]
+                actual_unit_price = inv_amount / inv_qty if inv_qty else None
+                if actual_unit_price and contracted_price:
+                    price_diff_pct = abs(actual_unit_price - contracted_price) / contracted_price
+                    if price_diff_pct > CONTRACT_PRICE_VARIANCE_PCT:
+                        severity = _priority_severity("Medium", inv_amount)
+                        ambiguities.append({
+                            "type"    : "contract_price_variance",
+                            "invoice" : inv,
+                            "severity": severity,
+                            "question": (
+                                f"{_priority_label(inv_amount)}"
+                                f"Invoice \"{_get_invoice_number(inv) or 'UNKNOWN'}\" unit price is "
+                                f"{_fmt_amount_val(actual_unit_price, _get_currency(inv))}, but the "
+                                f"contracted rate for \"{_get_vendor_name(inv)}\" is "
+                                f"{_fmt_amount_val(contracted_price, _get_currency(inv))} "
+                                f"({round(price_diff_pct * 100, 1)}% variance). "
+                                f"How should this be resolved?"
+                            ),
+                            "options": [
+                                "Approve at invoiced price",
+                                "Approve at contracted price",
+                                "Hold for vendor clarification",
+                                "Reject invoice",
+                            ],
+                        })
 
     for group in duplicates.get("groups", []):
         if group["type"] == "exact_invoice_number":
@@ -1335,7 +1613,9 @@ def apply_approvals(invoices: list, reconciliation: dict, approvals: list) -> li
         response = (approval.get("response") or "no_response") if approval else "no_response"
         status   = (approval.get("status")   or "pending")    if approval else "pending"
 
-        if amb["type"] in ("no_po_match", "amount_mismatch"):
+        if amb["type"] in ("no_po_match", "amount_mismatch", "currency_mismatch",
+                           "tax_discrepancy", "no_goods_receipt",
+                           "quantity_mismatch", "contract_price_variance"):
             inv = amb["invoice"]
             row = inv.copy()
             row["_reconciliation_status"] = "approved_with_flag" if status == "approved" else "held"
@@ -1404,6 +1684,18 @@ def _normalise_row(row: dict) -> dict:
                             "po number", "po#"],
         "date"          : ["invoicedate", "invoice_date", "date_of_invoice"],
         "currency"      : ["cur", "curr", "currency_code"],
+        # Point 2 fix: tax was only ever populated for OCR-scanned invoices
+        # (invoice_parser.py extracts it directly). CSV/XLSX invoices had no
+        # alias mapping at all, so `tax` was silently absent for the vast
+        # majority of uploads (spreadsheet exports, not scans).
+        "tax"           : ["tax_amount", "taxamount", "gst", "vat", "hsn",
+                            "tax_amt", "sales_tax"],
+        # Batch 3: shared by invoices (billed qty), POs (ordered qty), and
+        # GRN rows (received qty) — all normalised through this same table.
+        "quantity"      : ["qty", "quantity_received", "quantity_ordered",
+                            "units", "unit_qty", "received_qty"],
+        "unit_price"    : ["unitprice", "unit_cost", "price_per_unit",
+                            "contracted_rate", "contract_price", "rate"],
     }
 
     normalised = {}
@@ -1425,6 +1717,10 @@ def _normalise_row(row: dict) -> dict:
 
 def _get_invoice_number(row: dict) -> str:
     return str(row.get("invoice_number", "") or row.get("invoicenumber", "") or "").strip()
+
+
+def _get_po_number(row: dict) -> str:
+    return str(row.get("po_number", "") or row.get("ponumber", "") or "").strip()
 
 
 def _get_vendor_name(row: dict) -> str:
@@ -1454,6 +1750,109 @@ def _fmt_amount_val(amount, currency: str = "") -> str:
     if amount is None:
         return "N/A"
     return f"{currency} {amount:,.2f}".strip()
+
+
+def _get_currency(row: dict) -> str:
+    return str(row.get("currency", "") or "").strip().upper()
+
+
+def _currency_mismatch(inv_currency: str, po_currency: str) -> str:
+    """Returns 'ok' | 'unknown' (one or both missing) | 'mismatch'."""
+    if not inv_currency or not po_currency:
+        return "unknown"
+    return "ok" if inv_currency == po_currency else "mismatch"
+
+
+def _parse_tax(row: dict):
+    raw = row.get("tax")
+    if raw is None or raw == "":
+        return None
+    try:
+        cleaned = re.sub(r'[^\d.-]', '', str(raw))
+        return float(cleaned) if cleaned else None
+    except Exception:
+        return None
+
+
+def _get_quantity(row: dict):
+    raw = row.get("quantity")
+    if raw is None or raw == "":
+        return None
+    try:
+        cleaned = re.sub(r'[^\d.-]', '', str(raw))
+        return float(cleaned) if cleaned else None
+    except Exception:
+        return None
+
+
+def _get_unit_price(row: dict):
+    raw = row.get("unit_price")
+    if raw is None or raw == "":
+        return None
+    try:
+        cleaned = re.sub(r'[^\d.-]', '', str(raw))
+        return float(cleaned) if cleaned else None
+    except Exception:
+        return None
+
+
+def _tax_discrepancy(invoice: dict):
+    """
+    Point 2: sanity-check tax arithmetic using data already on the invoice —
+    NOT an assumed external tax rate (we have no contract/tax-rule data
+    source to check against). Only fires when we have enough information to
+    actually verify something:
+
+      - OCR-scanned invoices: sum(line_items totals) + tax vs invoice total.
+      - CSV/XLSX invoices with no line items: skipped — there's nothing on
+        the row to cross-check tax against, so we don't fabricate a mismatch.
+
+    Returns (has_discrepancy: bool, expected_total: float | None) or
+    (False, None) when there isn't enough data to check.
+    """
+    tax = _parse_tax(invoice)
+    line_items = invoice.get("line_items")
+    total = _parse_amount(invoice)
+
+    if tax is None or not line_items or total is None:
+        return False, None
+
+    try:
+        items_sum = sum(float(item.get("total") or 0) for item in line_items)
+    except (TypeError, ValueError):
+        return False, None
+
+    if items_sum <= 0:
+        return False, None
+
+    expected_total = items_sum + tax
+    if expected_total <= 0:
+        return False, None
+
+    diff_pct = abs(total - expected_total) / expected_total
+    return diff_pct > TAX_DISCREPANCY_PCT, expected_total
+
+
+def _priority_label(amount) -> str:
+    """Point 5: dollar-value-aware priority label for question wording."""
+    if amount is None:
+        return ""
+    if amount >= PRIORITY_HIGH_AMOUNT:
+        return "High-value — "
+    if amount >= PRIORITY_MEDIUM_AMOUNT:
+        return "Medium-value — "
+    return ""
+
+
+def _priority_severity(base_severity: str, amount) -> str:
+    """
+    Point 5: let dollar value escalate severity, never downgrade it.
+    A $50,000 amount mismatch should never be shown as "Medium" just
+    because the underlying issue type defaults to Medium severity.
+    """
+    if amount is not None and amount >= PRIORITY_HIGH_AMOUNT:
+        return "High"
+    return base_severity
 
 
 def _should_include(response: str) -> bool:
@@ -1501,4 +1900,3 @@ if __name__ == "__main__":
         tb = traceback.format_exc()
         sys.stdout.write(json.dumps({"ok": False, "error": str(e), "trace": tb}))
         sys.stdout.flush()
-

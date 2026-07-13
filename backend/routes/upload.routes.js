@@ -215,18 +215,31 @@ router.post('/zip', requireAuth, upload.single('file'), async (req, res, next) =
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded', code: 'NO_FILE' });
 
-    const validation = validateUpload(req.file);
+    // BUGFIX: validateUpload() is async (it inspects XLSX archive contents) —
+    // it was being called without `await`, so `validation` was a pending
+    // Promise object here, not the resolved result. `validation.type` was
+    // therefore always `undefined`, which never equals 'zip', so every
+    // upload — including perfectly valid ZIP files — was rejected with
+    // "Expected a ZIP file". This is the root cause of that error.
+    const validation = await validateUpload(req.file);
     if (validation.type !== 'zip') {
       _safeUnlink(req.file.path);
       return res.status(400).json({ error: 'Expected a ZIP file', code: 'WRONG_FILE_TYPE' });
     }
 
-    // FIX #1: Pass ZIP bomb limits to extractor
-    const extraction = await extractZip(req.file.path, {
-      maxExtractedBytes: MAX_ZIP_EXTRACTED_BYTES,
-      maxFiles         : MAX_ZIP_FILES,
-      maxRatio         : MAX_COMPRESSION_RATIO,
-    });
+    // BUGFIX: extractZip()'s real signature is (zipFilePath, baseExtractDir)
+    // where baseExtractDir must be a path STRING, not an options object.
+    // The previous call here passed {maxExtractedBytes, maxFiles, maxRatio}
+    // as the second argument — that object was never part of extractZip's
+    // actual API (ZIP-bomb/file-count/ratio limits are enforced entirely
+    // server-side in the Python engine, hardcoded, independent of anything
+    // JS passes — see data_engine.py MAX_ZIP_EXTRACT_BYTES etc). The object
+    // got truthy-coerced into `baseDir`, then `path.join(thatObject, jobId)`
+    // threw "The 'path' argument must be of type string. Received an
+    // instance of Object". This call was unreachable until the missing-
+    // `await` fix above started letting valid ZIPs through, which is why it
+    // surfaced only now — it's a second bug that was hidden behind the first.
+    const extraction = await extractZip(req.file.path);
 
     // FIX #5: Always clean up the uploaded ZIP after extraction
     _safeUnlink(req.file.path);
@@ -260,7 +273,8 @@ router.post('/xml', requireAuth, upload.single('file'), async (req, res, next) =
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded', code: 'NO_FILE' });
 
-    const validation = validateUpload(req.file);
+    // BUGFIX: same missing-await issue as /zip above.
+    const validation = await validateUpload(req.file);
     if (validation.type !== 'xml') {
       _safeUnlink(req.file.path);
       return res.status(400).json({ error: 'Expected an XML file', code: 'WRONG_FILE_TYPE' });
@@ -310,7 +324,8 @@ router.post('/parse', requireAuth, upload.single('file'), async (req, res, next)
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded', code: 'NO_FILE' });
 
-    const validation = validateUpload(req.file);
+    // BUGFIX: same missing-await issue as /zip above.
+    const validation = await validateUpload(req.file);
     if (!['csv', 'xlsx', 'xls', 'xml'].includes(validation.type)) {
       _safeUnlink(req.file.path);
       return res.status(400).json({

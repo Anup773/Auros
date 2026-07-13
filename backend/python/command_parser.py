@@ -533,7 +533,7 @@ def op_parse_command(config: dict) -> dict:
     # ── STEP 1.5: COMPOUND MULTI-RANGE COMMAND ────────────────────────────────
     compound_result = _parse_compound_command(t, text, ambiguities, total_items, amb_idx)
     if compound_result is not None:
-        return _apply_bulk_confirmation(compound_result, text)
+        return _apply_bulk_confirmation(compound_result, text, ambiguities, total_items)
 
     # ── STEP 2: FIX-02 NEGATION CHECK ────────────────────────────────────────
     if _has_leading_negation(t):
@@ -559,7 +559,7 @@ def op_parse_command(config: dict) -> dict:
         t, detected_action, ambiguities, total_items, amb_idx
     )
     if exclusion_result is not None:
-        return _apply_bulk_confirmation(exclusion_result, text)
+        return _apply_bulk_confirmation(exclusion_result, text, ambiguities, total_items)
 
     # ── STEP 5: Complex command check ─────────────────────────────────────────
     if _is_complex_command(t):
@@ -626,7 +626,7 @@ def op_parse_command(config: dict) -> dict:
         "emptyResult"      : (sel.type == "empty"),
         "audit"            : audit,
     }
-    return _apply_bulk_confirmation(result, text)
+    return _apply_bulk_confirmation(result, text, ambiguities, total_items)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1247,8 +1247,22 @@ def _parse_target(
             return SelectionExpr(type="indices", values=rem, total=total), "remaining", 0.0, "remaining"
         return SelectionExpr(type="all", total=total), "remaining", 0.0, "remaining"
 
-    if spec_sel is not None and spec_type in ("up_to", "first_n", "last_n", "next_n", "from_to", "amount_filter"):
+    if spec_sel is not None and spec_type in ("up_to", "first_n", "last_n", "next_n", "from_to"):
         return spec_sel, spec_type, 0.0, spec_type
+
+    if spec_sel is not None and spec_type == "amount_filter":
+        # BUGFIX: this used to return spec_sel directly — a symbolic
+        # SelectionExpr(type="filter", condition="amount < 500", ...) that
+        # was NEVER matched against real ambiguity data. Unlike vendor/
+        # currency/duplicate filters (which already route through
+        # _filter_with_indexes below), amount-range phrasing was detected
+        # earlier in _parse_position_spec and returned as an unresolved
+        # placeholder — "approve invoices under $500" matched nothing,
+        # ever, regardless of the range/indices materialisation fix above.
+        filter_sel, filter_type = _filter_with_indexes(t, ambiguities, total, exclude, amb_idx)
+        if filter_sel.type == "empty":
+            return filter_sel, filter_type, 0.0, "filter_no_match"
+        return filter_sel, filter_type, 0.0, "amount_filter"
 
     # ── 2. FIX-06: Explicit numeric range — only if NOT money context ─────────
     range_m = _RE_RANGE.search(t)
@@ -1544,12 +1558,78 @@ def _detect_conflicts(actions: list[dict]) -> list[dict]:
 # SECTION 14 — BULK CONFIRMATION (FIX-15 / FIX-16)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _apply_bulk_confirmation(result: dict, raw_text: str) -> dict:
+def _materialise_selection_dict(sel: dict, ambiguities: list, total: int,
+                                 exclude: set | None = None) -> list[int]:
+    """
+    BUGFIX: _make_action() only ever populated the "indices" field for
+    type=="indices" selections ("kept for backward compat... populated only
+    for small explicit lists" per its own comment) — every "range", "all",
+    or "filter" selection got indices=[] by design, on the assumption that
+    callers would materialise the compact `selection` field themselves when
+    they actually needed to execute it. The frontend never did this — it
+    only ever reads `action.indices` directly. That meant ANY range-based
+    command ("approve items 1 to 30"), not just bulk/confirmation-gated
+    ones, silently applied to nothing. This mirrors SelectionExpr.materialise()
+    exactly, but operates on the plain-dict form actions already carry by
+    the time they reach _apply_bulk_confirmation (they've already been
+    through _make_action()'s sel.to_dict() serialisation at that point).
+    """
+    exc = exclude or set()
+    sel_type = sel.get("type")
+
+    if sel_type == "indices":
+        return [i for i in sel.get("values", []) if i not in exc]
+
+    if sel_type == "range":
+        s = sel.get("start") or 0
+        e = min(sel.get("end", total - 1), total - 1)
+        result = []
+        for i in range(s, e + 1):
+            if i in exc:
+                continue
+            if ambiguities and i < len(ambiguities) and ambiguities[i].get("answered"):
+                continue
+            result.append(i)
+        return result
+
+    if sel_type == "all":
+        result = []
+        for i in range(total):
+            if i in exc:
+                continue
+            if ambiguities and i < len(ambiguities) and ambiguities[i].get("answered"):
+                continue
+            result.append(i)
+        return result
+
+    return []  # "filter" / "empty" — see amount_filter fix below for the one
+               # remaining case that can reach here in practice.
+
+
+def _apply_bulk_confirmation(result: dict, raw_text: str,
+                              ambiguities: list | None = None, total: int = 0) -> dict:
     """
     FIX-15: Uses _total_affected_est() — computed once, not repeated.
     FIX-16: MAX_BULK_ACTION guard.
+    BUGFIX: now materialises `indices` on every action from its `selection`
+    before returning — see _materialise_selection_dict() above. Safe at
+    scale: this function is the single choke point ALL parsed commands pass
+    through, so the fix applies everywhere automatically, but the actual
+    array size is always bounded — either by BULK_CONFIRM_THRESHOLD for the
+    direct-response path (small, sent to the client), or by MAX_BULK_ACTION
+    for the pending-confirmation path (up to 50,000 ints, but stored
+    server-side only — the confirmation PROMPT sent to the client still
+    only carries pendingId + a text summary, never the materialised array;
+    FIX-14's actual payload-size win is untouched).
     """
-    actions        = result.get("actions", [])
+    ambiguities = ambiguities or []
+    actions     = result.get("actions", [])
+
+    for action in actions:
+        sel = action.get("selection")
+        if sel and not action.get("indices"):
+            action["indices"] = _materialise_selection_dict(sel, ambiguities, total)
+
     total_affected = _total_affected_est(actions)
 
     # FIX-16: hard cap
@@ -1872,3 +1952,4 @@ if __name__ == "__main__":
             "trace": tb,
         }))
         sys.stdout.flush()
+

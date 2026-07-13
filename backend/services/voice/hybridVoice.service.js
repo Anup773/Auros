@@ -250,6 +250,50 @@ async function parseCommand(text, ambiguities = [], pendingConfirm = null) {
     };
   }
 
+  // ── Batch 2: Free-form Q&A routing ──────────────────────────────────────
+  // command_parser.py tags a result with audit.rule_id === 'no_action' only
+  // when it scanned the text and found ZERO action keywords (approve/reject/
+  // hold/etc) at all — as opposed to other needsAI reasons (complex_command,
+  // negation_detected, empty_filter_result...) which mean "this IS an action,
+  // just too complex for the local parser." Only 'no_action' is a strong
+  // signal the user asked a question rather than gave a command, so it's the
+  // one case we route to Q&A instead of forcing Gemini's action-interpreter
+  // to invent an action for text that was never trying to be one.
+  const isLikelyQuestion = parseResult.audit?.rule_id === 'no_action';
+
+  if (isLikelyQuestion && geminiSvc.isConfigured()) {
+    try {
+      const qaResult = await geminiSvc.answerDatasetQuestion(text, ambiguities);
+      return {
+        actions           : [],   // structural guarantee: Q&A can never trigger an action
+        confidence        : 1.0,
+        interpretation    : qaResult.answer,
+        commandSource     : 'gemini_qa',
+        isAnswer          : true,
+        needsAI           : true,
+        needsConfirmation : false,
+        cancelled         : false,
+      };
+    } catch (qaErr) {
+      const isQuota = qaErr.code === 'GEMINI_QUOTA_EXCEEDED';
+      console.warn('[hybridVoice] Q&A failed:', qaErr.message);
+      if (isQuota) {
+        return {
+          actions           : [],
+          confidence        : 0,
+          interpretation    : 'Gemini quota exceeded — could not answer your question. Please try again shortly.',
+          commandSource     : 'local_parser_fallback',
+          needsAI           : false,
+          needsConfirmation : false,
+          warning           : 'Gemini API quota exceeded.',
+          cancelled         : false,
+        };
+      }
+      // Non-quota Q&A failure — fall through to the existing handling below
+      // in case this was actually meant as an action after all.
+    }
+  }
+
   if (!geminiSvc.isConfigured()) {
     if (parseResult.actions && parseResult.actions.length > 0) {
       return {
@@ -419,6 +463,10 @@ function _sanitiseAmbiguities(ambiguities) {
   return ambiguities.map(amb => ({
     type    : amb.type,
     answered: amb.answered || false,
+    // Q&A aggregation (Batch 2) needs severity to answer questions like
+    // "how many high-severity issues are left" — harmless additive field,
+    // the existing command parser simply ignores keys it doesn't use.
+    severity: amb.severity || null,
     invoice : {
       vendor_name   : amb.invoice?.vendor_name    || amb.invoice?.vendor || '',
       amount        : amb.invoice?.amount          || amb.invoice?.total  || '',

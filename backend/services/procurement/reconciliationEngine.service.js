@@ -370,7 +370,8 @@ if (_cleanupInterval.unref) _cleanupInterval.unref();
 // SECTION 5 — PUBLIC API: startReconciliation
 // ══════════════════════════════════════════════════════════════════════════════
 
-async function startReconciliation(invoiceFilePath, poFilePath, userId) {
+async function startReconciliation(invoiceFilePath, poFilePath, userId, opts = {}) {
+  const { grnPath = null, contractPath = null } = opts;
   const jobId = `job_${Date.now()}_${crypto.randomBytes(16).toString('hex')}`;
 
   await _checkQueueLimits(userId);
@@ -387,6 +388,8 @@ async function startReconciliation(invoiceFilePath, poFilePath, userId) {
     status          : 'processing',
     invoiceFilePath,
     poFilePath      : poFilePath || null,
+    grnFilePath     : grnPath || null,
+    contractFilePath: contractPath || null,
     reconciliation  : null,
     pendingApprovals: [],
     createdAt       : new Date().toISOString(),
@@ -404,10 +407,12 @@ async function startReconciliation(invoiceFilePath, poFilePath, userId) {
       await _redisClient.ping();
 
       const bullJob   = await _reconcileQueue.add('reconcile', {
-        invoicePath: invoiceFilePath,
-        poPath     : poFilePath || undefined,
+        invoicePath : invoiceFilePath,
+        poPath      : poFilePath || undefined,
+        grnPath     : grnPath || undefined,
+        contractPath: contractPath || undefined,
         userId,
-        appJobId   : jobId,
+        appJobId    : jobId,
       });
 
       const bullJobId = String(bullJob.id);
@@ -726,9 +731,11 @@ async function _runReconciliation(jobId) {
   const job = await _requireJob(jobId);
 
   const engineResult = await callEngine({
-    operation  : 'reconcile',
-    invoicePath: job.invoiceFilePath,
-    poPath     : job.poFilePath || undefined,
+    operation   : 'reconcile',
+    invoicePath : job.invoiceFilePath,
+    poPath      : job.poFilePath || undefined,
+    grnPath     : job.grnFilePath || undefined,
+    contractPath: job.contractFilePath || undefined,
   }, { timeout: RECONCILE_TIMEOUT });
 
   const schemaError = _validateWorkerResult(engineResult);
@@ -1171,3 +1178,4 @@ module.exports = {
   cancelJob,
   closeConnections,
 };
+

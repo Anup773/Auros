@@ -98,6 +98,23 @@ export default function ProcurementWorkspace() {
   const [whatsappPhone,setWhatsappPhone]= useState('');
   const [whatsappSent, setWhatsappSent] = useState(false);
 
+  // Batch 3: optional supporting documents. Each is independent of the
+  // primary invoice upload — omitting any (or all) of them reproduces the
+  // exact reconciliation behavior from before this batch. poDatasetId was
+  // PREVIOUSLY hardcoded to `null` at the only call site below, meaning PO
+  // upload — and therefore all PO matching — was unreachable from this UI
+  // even though the backend fully supported it. Fixed here alongside GRN
+  // and contract, since none of the Batch 3 checks can ever fire without a
+  // PO to match against first.
+  const [poDatasetId,       setPoDatasetId]       = useState(null);
+  const [grnDatasetId,      setGrnDatasetId]      = useState(null);
+  const [contractDatasetId, setContractDatasetId] = useState(null);
+  const [poFileName,        setPoFileName]        = useState('');
+  const [grnFileName,       setGrnFileName]       = useState('');
+  const [contractFileName,  setContractFileName]  = useState('');
+  const [secondaryUploadError, setSecondaryUploadError] = useState('');
+  const [secondaryUploading,   setSecondaryUploading]   = useState('');
+
   function safe(fn) {
     return (...args) => { if (isMounted.current) fn(...args); };
   }
@@ -248,6 +265,28 @@ export default function ProcurementWorkspace() {
     setPhase(PHASE.PARSE);
   }
 
+  // Batch 3: shared handler for the three optional secondary uploads.
+  // `setter`/`nameSetter` are the React state setters for that specific
+  // dataset — this stays a single function rather than three near-identical
+  // ones. Errors here are surfaced separately from the main upload `error`
+  // state so a failed optional upload never blocks the primary flow.
+  async function handleSecondaryUpload(kind, file, setter, nameSetter) {
+    if (!file) return;
+    setSecondaryUploadError('');
+    setSecondaryUploading(kind);
+    try {
+      const uploadRes = await dataAPI.upload(file, token);
+      if (!isMounted.current) return;
+      setter(uploadRes.datasetId);
+      nameSetter(file.name);
+    } catch (err) {
+      if (!isMounted.current) return;
+      setSecondaryUploadError(`${kind} upload failed: ${err.message}`);
+    } finally {
+      safe(setSecondaryUploading)('');
+    }
+  }
+
   async function handleSelectZipFile(zipFileEntry) {
     if (!isMounted.current) return;
     setSelectedZipFile(zipFileEntry);
@@ -285,10 +324,16 @@ export default function ProcurementWorkspace() {
     if (!datasetId) return;
     setError('');
     setLoading(true);
-    setLoadingMsg('AI is matching invoices to POs and detecting duplicates…');
+    setLoadingMsg(
+      grnDatasetId || contractDatasetId
+        ? 'AI is matching invoices to POs, goods receipts, and contract rates…'
+        : 'AI is matching invoices to POs and detecting duplicates…'
+    );
     setProgress(10);
     try {
-      const { jobId: newJobId } = await procurementAPI.startReconciliation(datasetId, null, token);
+      const { jobId: newJobId } = await procurementAPI.startReconciliation(
+        datasetId, poDatasetId, token, grnDatasetId, contractDatasetId
+      );
       if (!isMounted.current) return;
       setJobId(newJobId);
       setProgress(30);
@@ -686,6 +731,44 @@ export default function ProcurementWorkspace() {
               </div>
             </div>
           )}
+
+          {/* Batch 3: optional supporting documents. All three are opt-in —
+              reconciliation works exactly as before if none are uploaded. */}
+          {datasetId && (
+            <div className="proc-secondary-uploads" style={{ marginTop: 24, padding: 16, border: '1px solid #e5e7eb', borderRadius: 8 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Optional: add supporting documents</div>
+              <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 12 }}>
+                Add a Purchase Order file to enable PO matching. Add a Goods Receipt (GRN) file for 3-way match,
+                or a vendor rate card for contract price compliance checks. All optional.
+              </div>
+
+              {[
+                { key: 'PO',       label: 'Purchase Orders',   name: poFileName,       setId: setPoDatasetId,       setName: setPoFileName },
+                { key: 'GRN',      label: 'Goods Receipts',    name: grnFileName,      setId: setGrnDatasetId,      setName: setGrnFileName },
+                { key: 'Contract', label: 'Vendor Rate Card',  name: contractFileName, setId: setContractDatasetId, setName: setContractFileName },
+              ].map(({ key, label, name, setId, setName }) => (
+                <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+                  <label style={{ minWidth: 140, fontSize: 13 }}>{label}:</label>
+                  <input
+                    type="file"
+                    accept=".csv,.xlsx,.xls"
+                    disabled={secondaryUploading === key}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      handleSecondaryUpload(key, f, setId, setName);
+                    }}
+                  />
+                  {secondaryUploading === key && <span style={{ fontSize: 12, color: '#6b7280' }}>Uploading…</span>}
+                  {name && secondaryUploading !== key && <span style={{ fontSize: 12, color: '#16a34a' }}>✓ {name}</span>}
+                </div>
+              ))}
+
+              {secondaryUploadError && (
+                <div style={{ fontSize: 13, color: '#dc2626', marginTop: 4 }}>{secondaryUploadError}</div>
+              )}
+            </div>
+          )}
+
           {datasetId && (
             <button className="btn-primary" style={{ marginTop: 20 }} onClick={handleStartReconciliation}>
               Start AI Reconciliation →

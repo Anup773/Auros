@@ -70,15 +70,41 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 
+// BUGFIX: This component previously called fetch('/api/voice/...') with a
+// relative path. There is no CRA dev-server proxy configured (no "proxy"
+// field in frontend/package.json), so those requests were resolving against
+// the FRONTEND's own origin (e.g. http://localhost:3000) instead of the
+// backend (http://localhost:4000 / REACT_APP_API_URL). The frontend has no
+// such route, so every voice/text command request silently hit React's
+// client-side-routing fallback and got back index.html — non-JSON — which
+// is exactly the "non-JSON response from server" error and the reason typed
+// commands only ever appeared to understand a few fixed keywords: EVERY
+// request was quietly failing over to the weak local _localParse() below,
+// and the real backend parser (command_parser.py) + Gemini fallback were
+// never actually being reached.
+// Fix: build absolute URLs the same way services/api.js does.
+const BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:4000';
+
 // ── Constants — no more magic strings ─────────────────────────────────────────
 const MIC_PHASE = { IDLE: 'idle', RECORDING: 'recording', PROCESSING: 'processing' };
 const MSG_TYPE  = { SUCCESS: 'success', ERROR: 'error', INFO: 'info', CONFIRM: 'confirm', DEFAULT: 'default' };
 const CMD_SRC   = { LOCAL: 'local_parser', FALLBACK: 'local_parser_fallback', GEMINI: 'gemini_ai',
-                    TYPED: 'typed', LOCAL_FB: 'local_fallback', CONFIRMED: 'confirmed', NONE: 'none' };
+                    TYPED: 'typed', LOCAL_FB: 'local_fallback', CONFIRMED: 'confirmed', NONE: 'none',
+                    QA: 'gemini_qa' };
 
 const ONBOARDING_KEY = 'auros_copilot_v3';
 const MAX_MESSAGES   = 200;   // FIX 6: cap message history
-const FETCH_TIMEOUT  = 30_000; // FIX 11: 30s timeout
+// BUGFIX: a single 30s timeout was shared by both text and voice requests.
+// The backend's own worst-case processing time already exceeds that for
+// voice: transcription (up to 30s) + local parsing (up to 10s) + a possible
+// Gemini fallback call (up to 15s), chained sequentially = up to 55s. A 30s
+// client-side abort could never actually accommodate that path — it was a
+// pre-existing mismatch between this constant and the backend's own timeout
+// budget, not something introduced by any single change. Text doesn't pay
+// the transcription cost, so its worst case (parsing + Gemini ≈ 25s) fits
+// more comfortably inside 30s, but it gets slightly more headroom too.
+const TEXT_FETCH_TIMEOUT  = 35_000;
+const VOICE_FETCH_TIMEOUT = 65_000; // 55s backend worst case + margin
 const MAX_CONFIRM_DEPTH = 3;   // FIX 5: loop protection
 
 const EXAMPLE_COMMANDS = [
@@ -90,6 +116,10 @@ const EXAMPLE_COMMANDS = [
   'Approve all EUR invoices',
   'Reject all duplicate invoices',
   'Approve all',
+  // Batch 2: these aren't actions — they'll be routed to Q&A instead of
+  // action-parsing, since they contain no approve/reject/hold keyword.
+  'Which vendor has the most flagged invoices?',
+  "What's our total flagged amount?",
 ];
 
 const SOURCE_LABELS = {
@@ -100,6 +130,7 @@ const SOURCE_LABELS = {
   [CMD_SRC.LOCAL_FB] : { text: 'Local fallback',          color: '#9ca3af' },
   [CMD_SRC.CONFIRMED]: { text: 'Confirmed',               color: '#16a34a' },
   [CMD_SRC.NONE]     : { text: 'Voice unavailable',       color: '#9ca3af' },
+  [CMD_SRC.QA]        : { text: 'AI · answered',           color: '#7c3aed' },
 };
 
 const ACTION_RESPONSES = {
@@ -169,7 +200,7 @@ export default function ProcurementCopilot({ ambiguities = [], jobId, onApply, t
     }
     const headers = {};
     if (token) headers['Authorization'] = `Bearer ${token}`;
-    fetch('/api/voice/health', { credentials: 'include', headers })
+    fetch(`${BASE_URL}/api/voice/health`, { credentials: 'include', headers })
       .then(r => r.ok ? r.json() : null)
       .then(d => setWhisperAvail(d?.available ?? false))
       .catch(() => setWhisperAvail(false));
@@ -235,8 +266,14 @@ export default function ProcurementCopilot({ ambiguities = [], jobId, onApply, t
         return;
       }
 
+      // BUGFIX: the backend no longer returns raw `pendingActions` — that
+      // was a financial-approval-bypass risk (see hybridVoice.service.js
+      // FIX 2: a user could forge arbitrary approval actions in that field).
+      // It now returns an opaque `pendingId` and looks the real actions up
+      // server-side on confirm. Store the pendingId, not a reconstructed
+      // actions array.
       setPendingConfirm({
-        actions       : data.pendingActions || [],
+        pendingId     : data.pendingId || null,
         interpretation: data.interpretation || '',
         totalAffected : data.totalAffected || 0,
       });
@@ -249,6 +286,20 @@ export default function ProcurementCopilot({ ambiguities = [], jobId, onApply, t
 
     // Reset confirmation depth on any definitive result
     confirmDepthRef.current = 0;
+
+    // Batch 2: free-form Q&A answers are informational only — never run
+    // them through the action-application path below (data.actions is
+    // always [] for this source anyway, enforced backend-side, but this
+    // branch also gives the answer proper message styling instead of
+    // falling into the generic "couldn't parse that command" error).
+    if (data.isAnswer || data.commandSource === CMD_SRC.QA) {
+      setPendingConfirm(null);
+      addMsg('assistant', data.interpretation || "I couldn't find an answer in the current data.", {
+        type       : MSG_TYPE.INFO,
+        sourceLabel: SOURCE_LABELS[CMD_SRC.QA],
+      });
+      return;
+    }
 
     if (data.cancelled) {
       setPendingConfirm(null);
@@ -341,20 +392,21 @@ export default function ProcurementCopilot({ ambiguities = [], jobId, onApply, t
     abortControllerRef.current = controller;
 
     // FIX 11: Timeout via AbortController
-    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+    const timeoutId = setTimeout(() => controller.abort(), TEXT_FETCH_TIMEOUT);
 
     try {
-      const res = await fetch('/api/voice/text-command', {
+      // BUGFIX: absolute URL (was relative — see BASE_URL comment above).
+      const res = await fetch(`${BASE_URL}/api/voice/text-command`, {
         method     : 'POST',
         headers    : authHeaders(),
         credentials: 'include',
         signal     : controller.signal,
         body       : JSON.stringify({
           text,
-          ambiguities   : _sanitise(ambiguities),
-          pendingConfirm: pendingConfirm
-            ? { actions: pendingConfirm.actions, interpretation: pendingConfirm.interpretation, totalAffected: pendingConfirm.totalAffected }
-            : undefined,
+          ambiguities: _sanitise(ambiguities),
+          // BUGFIX: backend reads req.body.pendingId (an opaque string),
+          // not a raw pendingConfirm object — see voice.routes.js FIX 1.
+          pendingId  : pendingConfirm?.pendingId || null,
         }),
       });
 
@@ -410,23 +462,25 @@ export default function ProcurementCopilot({ ambiguities = [], jobId, onApply, t
     if (abortControllerRef.current) abortControllerRef.current.abort();
     const controller = new AbortController();
     abortControllerRef.current = controller;
-    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+    const timeoutId = setTimeout(() => controller.abort(), VOICE_FETCH_TIMEOUT);
 
     try {
       const formData = new FormData();
       formData.append('audio', blob, 'voice.webm');
       formData.append('ambiguities', JSON.stringify(_sanitise(ambiguities)));
-      if (pendingConfirm) {
-        formData.append('pendingConfirm', JSON.stringify({
-          actions: pendingConfirm.actions, interpretation: pendingConfirm.interpretation,
-          totalAffected: pendingConfirm.totalAffected,
-        }));
+      // BUGFIX: backend reads req.body.pendingId (an opaque string) from the
+      // multipart form — not a raw pendingConfirm object. See voice.routes.js
+      // FIX 1 / hybridVoice.service.js FIX 2 for why the raw-actions payload
+      // was removed (forged-approval risk).
+      if (pendingConfirm?.pendingId) {
+        formData.append('pendingId', pendingConfirm.pendingId);
       }
 
       const headers = {};
       if (token) headers['Authorization'] = `Bearer ${token}`;
 
-      const res = await fetch('/api/voice/command', {
+      // BUGFIX: absolute URL (was relative — see BASE_URL comment above).
+      const res = await fetch(`${BASE_URL}/api/voice/command`, {
         method: 'POST', headers, credentials: 'include',
         body: formData, signal: controller.signal,
       });

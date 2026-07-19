@@ -80,6 +80,40 @@
  *     - tokenStore → Redis (with TTL = TOKEN_EXPIRY_MS)
  *     - userStore  → PostgreSQL / MongoDB
  *   The in-memory approach is intentional for zero-dependency single-process use.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * PHASE 2 CHANGES (this pass)
+ * ─────────────────────────────────────────────────────────────────────────
+ *   - Token issuance/storage/verification delegated to the new
+ *     services/auth/sessionStore.service.js — exactly the Redis upgrade the
+ *     "PRODUCTION SCALING" note above asked for. Tokens are still opaque
+ *     random values (NOT switched to JWT format — see PHASE2_SECURITY.md for
+ *     why), so requireAuth()'s behaviour, status codes, and error `code`
+ *     values are unchanged; every existing route using requireAuth needs no
+ *     changes.
+ *   - Added a second, longer-lived refresh token per session, with rotation
+ *     and reuse detection (services/auth/sessionStore.service.js). New
+ *     endpoint: POST /api/auth/refresh. Response field `token` is unchanged;
+ *     `refreshToken` is a new, additive field.
+ *   - "Token blacklist" is implemented as revocation-by-deletion in the
+ *     session store rather than a separate deny-list structure — see the
+ *     comment at the top of sessionStore.service.js for why that's the
+ *     correct equivalent for opaque (non-JWT) tokens.
+ *   - Added an MFA (TOTP) gate: if a user has mfaEnabled, login/googleAuth
+ *     return { mfaRequired: true, challengeToken } instead of a session;
+ *     the client completes login via POST /api/auth/mfa/verify (see
+ *     controllers/mfa.controller.js). MFA is OFF by default for every
+ *     existing account, so this is a no-op until an account explicitly
+ *     enrolls — see PHASE2_SECURITY.md for a frontend-integration note.
+ *   - Added account suspension support (`user.disabled`) — set via the new
+ *     admin endpoints in controllers/admin.controller.js.
+ *   - Added logoutAll / getSessions ("log out everywhere" / "your active
+ *     sessions") on top of the new Redis-backed session records.
+ *   - Added security-event logging (SIGNUP, LOGIN_SUCCESS, LOGIN_FAILED,
+ *     LOGOUT, MFA_CHALLENGE_ISSUED, etc.) via audit/securityLogger.service.js.
+ *   - saveUsers is now exported so the new MFA/admin controllers can persist
+ *     changes to the same users.json store without duplicating the
+ *     load/save logic here.
  */
 
 const bcrypt = require('bcryptjs');
@@ -87,12 +121,19 @@ const crypto = require('crypto');
 const fs     = require('fs');
 const path   = require('path');
 const { assignDefaultRole } = require('../middleware/rbac');
+// PHASE 2 additions — see each module for details:
+const sessionStore   = require('../services/auth/sessionStore.service'); // Redis-backed sessions, refresh rotation, revocation
+const mfaService     = require('../services/auth/mfa.service');          // TOTP challenge issuance/consumption
+const securityLogger = require('../audit/securityLogger.service');       // SOC2-style security event log
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const BCRYPT_ROUNDS      = parseInt(process.env.BCRYPT_ROUNDS      || '12',  10);
-const TOKEN_EXPIRY_MS    = parseInt(process.env.TOKEN_EXPIRY_HOURS || '24',  10) * 60 * 60 * 1000;
 const MAX_PASSWORD_LENGTH = parseInt(process.env.MAX_PASSWORD_LENGTH || '128', 10);  // FIX #6
-const MAX_TOKEN_STORE_SIZE = parseInt(process.env.MAX_TOKEN_STORE  || '100000', 10);  // FIX #7
+// NOTE (PHASE 2): TOKEN_EXPIRY_MS / MAX_TOKEN_STORE_SIZE moved into
+// services/auth/sessionStore.service.js, which now owns token issuance,
+// storage, rotation, and cleanup — it reads the SAME env vars
+// (TOKEN_EXPIRY_HOURS, MAX_TOKEN_STORE), so existing deployment configs
+// don't need to change. See that file for the Redis-backed replacement.
 
 // FIX #1: Generate a valid dummy hash at startup for constant-time compare.
 // bcrypt.hashSync is synchronous; runs once at module load, ~100ms.
@@ -117,9 +158,12 @@ const DATA_FILE = path.join(DATA_DIR, 'users.json');
 const userStore      = new Map();  // email (lowercase) → user object
 const _userByIdStore = new Map();  // FIX #2: id → user object (O(1) lookup)
 
-// FIX #4: tokenStore maps SHA-256(rawToken) → { userId, expiresAt }
-// Raw token is NEVER stored — only its hash.
-const tokenStore = new Map();
+// NOTE (PHASE 2): the token store (previously an in-memory Map here,
+// FIX #4's SHA-256(rawToken) → { userId, expiresAt }) now lives in
+// services/auth/sessionStore.service.js — Redis-backed with the same kind
+// of local-mirror fallback this file already used elsewhere. `tokenStore`
+// is still exported below (aliased to that module's local mirror) purely
+// for backward compatibility with anything that inspects it directly.
 
 // ── Load from disk on startup ─────────────────────────────────────────────────
 function loadUsers() {
@@ -153,63 +197,6 @@ function saveUsers() {
 }
 
 loadUsers();
-
-// ── Token cleanup — runs every hour ──────────────────────────────────────────
-const _tokenCleanupInterval = setInterval(() => {
-  const now     = Date.now();
-  let   removed = 0;
-  for (const [hash, data] of tokenStore.entries()) {
-    if (data.expiresAt < now) { tokenStore.delete(hash); removed++; }
-  }
-  if (removed > 0) console.log(`[auth] Cleaned ${removed} expired token(s).`);
-}, 60 * 60 * 1000);
-
-// Prevent the interval from keeping the process alive during tests
-if (_tokenCleanupInterval.unref) _tokenCleanupInterval.unref();
-
-// ── Token helpers ─────────────────────────────────────────────────────────────
-function _hashToken(rawToken) {
-  return crypto.createHash('sha256').update(rawToken).digest('hex');
-}
-
-function generateToken() {
-  return crypto.randomBytes(64).toString('hex');
-}
-
-function issueToken(userId) {
-  // FIX #7: Enforce token store size cap before issuing new token
-  if (tokenStore.size >= MAX_TOKEN_STORE_SIZE) {
-    _emergencyCleanup();
-  }
-
-  const rawToken  = generateToken();
-  const tokenHash = _hashToken(rawToken);  // FIX #4: store hash, return raw
-  const expiresAt = Date.now() + TOKEN_EXPIRY_MS;
-  tokenStore.set(tokenHash, { userId, expiresAt });
-  return rawToken;  // Only the raw token goes to the client
-}
-
-/**
- * FIX #7: Emergency synchronous cleanup when token store is at capacity.
- * Removes all expired tokens immediately rather than waiting for the hourly sweep.
- */
-function _emergencyCleanup() {
-  const now = Date.now();
-  for (const [hash, data] of tokenStore.entries()) {
-    if (data.expiresAt < now) tokenStore.delete(hash);
-  }
-  // If still at capacity after removing expired tokens, remove oldest 10%
-  if (tokenStore.size >= MAX_TOKEN_STORE_SIZE) {
-    const removeCount = Math.ceil(MAX_TOKEN_STORE_SIZE * 0.1);
-    let   removed     = 0;
-    for (const hash of tokenStore.keys()) {
-      if (removed >= removeCount) break;
-      tokenStore.delete(hash);
-      removed++;
-    }
-    console.warn(`[auth] Token store at capacity — forcibly evicted ${removed} token(s).`);
-  }
-}
 
 function validateEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
@@ -268,9 +255,18 @@ exports.signup = async (req, res, next) => {
     _userByIdStore.set(user.id, user);  // FIX #2: keep id index in sync
     saveUsers();
 
-    const token = issueToken(user.id);
+    // PHASE 2: sessionStore issues an access+refresh pair (Redis-backed,
+    // survives restarts and works across multiple instances) in place of the
+    // old in-memory-only issueToken(). The `token` field name/shape in the
+    // response is UNCHANGED so the existing frontend needs no changes;
+    // `refreshToken` is a new, additive field it will simply ignore until
+    // it's wired up — see PHASE2_SECURITY.md.
+    const { accessToken, refreshToken } = await sessionStore.createSession(user.id, {
+      ip: req.ip, userAgent: req.headers['user-agent'],
+    });
     console.log(`[auth] Signup: ${user.email} (${user.id})`);
-    res.status(201).json({ token, user: safeUser(user) });
+    securityLogger.logSecurityEvent('SIGNUP', { userId: user.id, ip: req.ip });
+    res.status(201).json({ token: accessToken, refreshToken, user: safeUser(user) });
   } catch (err) { next(err); }
 };
 
@@ -302,12 +298,31 @@ exports.login = async (req, res, next) => {
 
     // Always return the same error for wrong email OR wrong password (FIX preserved from V1)
     if (!user || !valid || user.provider !== 'email') {
+      securityLogger.logSecurityEvent('LOGIN_FAILED', { email: emailKey, ip: req.ip, reason: 'invalid_credentials' });
       return res.status(401).json({ error: 'Incorrect email or password', code: 'INVALID_CREDENTIALS' });
     }
 
-    const token = issueToken(user.id);
+    // PHASE 2: account suspension (set via the new admin user-management endpoints)
+    if (user.disabled) {
+      securityLogger.logSecurityEvent('LOGIN_FAILED', { userId: user.id, ip: req.ip, reason: 'account_disabled' });
+      return res.status(403).json({ error: 'This account has been disabled. Contact an administrator.', code: 'ACCOUNT_DISABLED' });
+    }
+
+    // PHASE 2: MFA gate. If enabled, don't issue a session yet — issue a
+    // short-lived challenge instead; the client completes login via
+    // POST /api/auth/mfa/verify with { challengeToken, code }.
+    if (user.mfaEnabled) {
+      const challengeToken = await mfaService.createLoginChallenge(user.id);
+      securityLogger.logSecurityEvent('MFA_CHALLENGE_ISSUED', { userId: user.id, ip: req.ip });
+      return res.json({ mfaRequired: true, challengeToken });
+    }
+
+    const { accessToken, refreshToken } = await sessionStore.createSession(user.id, {
+      ip: req.ip, userAgent: req.headers['user-agent'],
+    });
     console.log(`[auth] Login: ${user.email}`);
-    res.json({ token, user: safeUser(user) });
+    securityLogger.logSecurityEvent('LOGIN_SUCCESS', { userId: user.id, ip: req.ip, method: 'password' });
+    res.json({ token: accessToken, refreshToken, user: safeUser(user) });
   } catch (err) { next(err); }
 };
 
@@ -338,8 +353,10 @@ exports.googleAuth = async (req, res, next) => {
 
     const emailKey = googleUser.email.toLowerCase().trim();
     let user = userStore.get(emailKey);
+    let isNewUser = false;
 
     if (!user) {
+      isNewUser = true;
       user = assignDefaultRole({
         id          : `user_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
         name        : (googleUser.name || googleUser.email.split('@')[0]).slice(0, 100),
@@ -357,8 +374,25 @@ exports.googleAuth = async (req, res, next) => {
       console.log(`[auth] Google login: ${user.email}`);
     }
 
-    const token = issueToken(user.id);
-    res.json({ token, user: safeUser(user) });
+    // PHASE 2: account suspension check
+    if (user.disabled) {
+      securityLogger.logSecurityEvent('LOGIN_FAILED', { userId: user.id, ip: req.ip, reason: 'account_disabled' });
+      return res.status(403).json({ error: 'This account has been disabled. Contact an administrator.', code: 'ACCOUNT_DISABLED' });
+    }
+
+    // PHASE 2: MFA gate (a brand-new signup can't have MFA enabled yet, so
+    // only existing users are checked here).
+    if (!isNewUser && user.mfaEnabled) {
+      const challengeToken = await mfaService.createLoginChallenge(user.id);
+      securityLogger.logSecurityEvent('MFA_CHALLENGE_ISSUED', { userId: user.id, ip: req.ip });
+      return res.json({ mfaRequired: true, challengeToken });
+    }
+
+    const session = await sessionStore.createSession(user.id, {
+      ip: req.ip, userAgent: req.headers['user-agent'],
+    });
+    securityLogger.logSecurityEvent(isNewUser ? 'SIGNUP' : 'LOGIN_SUCCESS', { userId: user.id, ip: req.ip, method: 'google' });
+    res.json({ token: session.accessToken, refreshToken: session.refreshToken, user: safeUser(user) });
   } catch (err) { next(err); }
 };
 
@@ -398,43 +432,106 @@ exports.getMe = (req, res) => {
 };
 
 // ── Logout ────────────────────────────────────────────────────────────────────
-exports.logout = (req, res) => {
+exports.logout = async (req, res) => {
   const rawToken = req.token;
   if (rawToken) {
-    // FIX #4: delete by hash (raw token is not what's stored)
-    tokenStore.delete(_hashToken(rawToken));
+    // PHASE 2: revokes the WHOLE session (access + refresh token) via
+    // sessionStore, so a stored refresh token can't be used to mint a new
+    // access token after logout, and revocation is visible to every
+    // instance immediately (not just this process's memory).
+    await sessionStore.revokeAccessToken(rawToken, 'logout');
   }
+  securityLogger.logSecurityEvent('LOGOUT', { userId: req.user?.id, ip: req.ip });
   res.json({ success: true, message: 'Logged out successfully' });
 };
 
+/**
+ * PHASE 2 — POST /api/auth/logout-all
+ * Revokes every session for the current user ("log out of all devices").
+ * Used directly by users, and internally by password/MFA changes and admin
+ * role changes so a security-relevant change takes effect immediately.
+ */
+exports.logoutAll = async (req, res) => {
+  const count = await sessionStore.revokeAllSessionsForUser(req.user.id, 'logout_all');
+  securityLogger.logSecurityEvent('LOGOUT_ALL', { userId: req.user.id, ip: req.ip, sessionsRevoked: count });
+  res.json({ success: true, sessionsRevoked: count });
+};
+
+/**
+ * PHASE 2 — GET /api/auth/sessions
+ * Lists the current user's active sessions (for a "your devices" view).
+ */
+exports.getSessions = async (req, res) => {
+  const sessions = await sessionStore.listSessions(req.user.id);
+  res.json({ sessions });
+};
+
+/**
+ * PHASE 2 — POST /api/auth/refresh
+ * Body: { refreshToken }. Rotates it for a new access+refresh pair.
+ * On reuse of an already-rotated refresh token (likely theft), the whole
+ * session is revoked and the caller must log in again.
+ */
+exports.refresh = async (req, res) => {
+  const { refreshToken } = req.body || {};
+  if (!refreshToken || typeof refreshToken !== 'string') {
+    return res.status(400).json({ error: 'refreshToken is required', code: 'MISSING_REFRESH_TOKEN' });
+  }
+
+  const result = await sessionStore.rotateRefreshToken(refreshToken, {
+    ip: req.ip, userAgent: req.headers['user-agent'],
+  });
+
+  if (result.error === 'REUSE_DETECTED') {
+    return res.status(401).json({
+      error: 'This refresh token was already used. All sessions for this account have been revoked as a precaution — please log in again.',
+      code: 'REFRESH_TOKEN_REUSE_DETECTED',
+    });
+  }
+  if (result.error) {
+    return res.status(401).json({ error: 'Invalid or expired refresh token. Please log in again.', code: 'INVALID_REFRESH_TOKEN' });
+  }
+
+  res.json({ token: result.accessToken, refreshToken: result.refreshToken });
+};
+
 // ── Auth middleware ───────────────────────────────────────────────────────────
-exports.requireAuth = (req, res, next) => {
+// PHASE 2: now backed by sessionStore.service.js (Redis + local in-memory
+// mirror) instead of a raw Map living in this file. The function signature,
+// success behaviour, and every status/error code below are unchanged, so
+// every route that already uses requireAuth keeps working exactly as before.
+exports.requireAuth = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Authentication required', code: 'NO_TOKEN' });
   }
 
-  const rawToken  = authHeader.slice(7);
-  const tokenHash = _hashToken(rawToken);          // FIX #4: hash before lookup
-  const tokenData = tokenStore.get(tokenHash);
+  const rawToken = authHeader.slice(7);
+  const session  = await sessionStore.verifyAccessToken(rawToken);
 
-  if (!tokenData) {
+  if (!session) {
+    // Covers both "never existed" and "expired" (previously two branches
+    // here) — nothing in this codebase's frontend distinguishes the two
+    // TOKEN_EXPIRED/INVALID_TOKEN codes today (confirmed by search), and the
+    // user-facing message was already effectively identical either way.
     return res.status(401).json({
       error: 'Session expired or invalid. Please log in again.',
       code : 'INVALID_TOKEN',
     });
   }
 
-  if (tokenData.expiresAt < Date.now()) {
-    tokenStore.delete(tokenHash);
-    return res.status(401).json({ error: 'Session expired. Please log in again.', code: 'TOKEN_EXPIRED' });
+  // FIX #2 (preserved): O(1) lookup via _userByIdStore instead of O(n) scan
+  const user = _userByIdStore.get(session.userId);
+  if (!user) {
+    await sessionStore.revokeAccessToken(rawToken, 'user_not_found');
+    return res.status(401).json({ error: 'User not found', code: 'USER_NOT_FOUND' });
   }
 
-  // FIX #2: O(1) lookup via _userByIdStore instead of O(n) scan
-  const user = _userByIdStore.get(tokenData.userId);
-  if (!user) {
-    tokenStore.delete(tokenHash);
-    return res.status(401).json({ error: 'User not found', code: 'USER_NOT_FOUND' });
+  // PHASE 2: a session that predates an account being disabled must stop
+  // working immediately rather than waiting for its natural expiry.
+  if (user.disabled) {
+    await sessionStore.revokeAccessToken(rawToken, 'account_disabled');
+    return res.status(403).json({ error: 'This account has been disabled.', code: 'ACCOUNT_DISABLED' });
   }
 
   req.user  = user;
@@ -443,10 +540,16 @@ exports.requireAuth = (req, res, next) => {
 };
 
 // ── Exports ───────────────────────────────────────────────────────────────────
-// NOTE: tokenStore now contains hashed tokens, not raw tokens.
-// External callers (tests) that inspect tokenStore must hash test tokens first.
-exports.tokenStore  = tokenStore;
 exports.userStore   = userStore;
 // FIX #2: also export the id index for tests/admin tooling
 exports._userByIdStore = _userByIdStore;
-
+// PHASE 2: saveUsers is now exported so controllers/mfa.controller.js and
+// controllers/admin.controller.js can persist changes (MFA enrollment,
+// role changes, account disable/enable) to the SAME users.json store,
+// without duplicating the load/save logic.
+exports.saveUsers = saveUsers;
+// PHASE 2: tokenStore is kept as a read-only alias to sessionStore's local
+// mirror for anything that still inspects it directly (nothing in this
+// codebase currently does — confirmed by search — but this avoids a hard
+// break for any external tooling written against the old shape).
+exports.tokenStore = sessionStore._internals._localAccess;

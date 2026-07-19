@@ -8,12 +8,16 @@
     "dev": "nodemon server.js",
     "worker": "node queues/worker.js",
     "worker:dev": "nodemon queues/worker.js",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test test/*.test.js",
     "lint": "eslint . --ext .js",
+    "backup": "node scripts/backup.js",
+    "restore": "node scripts/restore.js",
     "py:install": "pip install -r python/requirements.txt --break-system-packages",
     "py:check": "python3 python/data_engine.py < /dev/null || true"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1085.0",
+    "@aws-sdk/s3-request-presigner": "^3.1085.0",
     "@google/generative-ai": "^0.24.1",
     "bcryptjs": "^2.4.3",
     "bullmq": "^5.0.0",
@@ -26,12 +30,15 @@
     "ioredis": "^5.3.2",
     "multer": "^2.1.1",
     "openai": "^6.35.0",
+    "otplib": "^13.4.1",
     "papaparse": "^5.5.3",
+    "qrcode": "^1.5.4",
     "twilio": "^6.0.2",
     "xlsx": "^0.18.5",
     "zod": "^3.25.0"
   },
   "devDependencies": {
+    "aws-sdk-client-mock": "^4.1.0",
     "eslint": "^8.57.0",
     "nodemon": "^3.1.2"
   },

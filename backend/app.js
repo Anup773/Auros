@@ -16,12 +16,12 @@
  *   - HIGH: Billing webhook comment clarified.
  *     express.json() IS registered globally before billing route.
  *     billing.routes.js MUST call express.raw() on the webhook sub-path itself
- *     to override the body parser before Stripe signature verification.
+ *     to override the body parser before Paddle signature verification.
  *     Added assertion comment so future maintainers don't remove it.
  *
  *   - MEDIUM: Gzip compression added via the `compression` package.
  *     Reduces response sizes for large OCR / AI / pipeline report payloads.
- *     Excluded for Stripe webhook path to preserve raw body for sig check.
+ *     Excluded for the Paddle webhook path to preserve raw body for sig check.
  *
  *   - MEDIUM: CORS origin matching now normalises trailing slashes.
  *     Old: exact string match — "https://app.com/" ≠ "https://app.com"
@@ -49,6 +49,27 @@
  *   7. CORS locked down
  *   8. Trust proxy for accurate IP rate limiting
  *   9. BullMQ queue route (/api/queue/*)
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * PHASE 2 CHANGES (this pass)
+ * ─────────────────────────────────────────────────────────────────────────
+ *   - Added requestId middleware (very first in the stack) — every request
+ *     gets a correlation ID (req.id / X-Request-Id) that flows through the
+ *     new security event log for tracing.
+ *   - Mounted /api/admin (routes/admin.routes.js) — user listing, role
+ *     management, account disable/enable, security-log access. Admin-only.
+ *   - authLimiter (already used for signup/login/google below) extended to
+ *     the new brute-forceable Phase 2 endpoints: /api/auth/refresh and the
+ *     MFA verification endpoints, for the same reason it's already on login.
+ *   - CORS: added exposedHeaders so browser JS can read X-Request-Id.
+ *   - DOC FIX: several comments in this file referred to "Stripe" — the
+ *     actual billing provider is Paddle (see services/payments/paddle.service.js
+ *     and routes/billing.routes.js). The underlying behaviour (raw body
+ *     preserved for signature verification) was already correct; only the
+ *     comments were stale.
+ *   - See controllers/auth.controller.js, services/auth/sessionStore.service.js,
+ *     and PHASE2_SECURITY.md for the session/refresh-token/MFA changes
+ *     themselves — this file only wires the new routes/middleware in.
  */
 
 const express     = require('express');
@@ -67,8 +88,14 @@ const {
 } = require('./middleware/rateLimiter');
 
 const { validate, schemas, sanitiseParams } = require('./middleware/validate');
+const requestId = require('./middleware/requestId'); // PHASE 2 — correlation ID for logs
 
 const app = express();
+
+// PHASE 2: request correlation ID — mounted first so every subsequent
+// middleware/route/log line (including ones added below) can use req.id.
+// Purely additive: does not change any response body or status code.
+app.use(requestId);
 
 // Exported so server.js can apply it to the HTTP server instance.
 // This stays a SHORT default (30s) on purpose — it's the slowloris/stalled-
@@ -167,15 +194,16 @@ app.use(cors({
     callback(new Error(`CORS: origin ${origin} not allowed`));
   },
   credentials   : true,
-  methods       : ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods       : ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['X-Request-Id'], // PHASE 2 — lets browser JS read the correlation ID
 }));
 
 // ── SECURITY: Global rate limiter ─────────────────────────────────────────────
 app.use(globalLimiter);
 
 // ── Compression (gzip) ────────────────────────────────────────────────────────
-// FIX: exclude Stripe webhook path — raw body must be preserved for sig verification
+// FIX: exclude the Paddle webhook path — raw body must be preserved for sig verification
 app.use(compression({
   filter: (req) => {
     if (req.path && req.path.startsWith('/api/billing/webhook')) return false;
@@ -185,9 +213,9 @@ app.use(compression({
 
 // ── Body parsing ──────────────────────────────────────────────────────────────
 // NOTE FOR MAINTAINERS: express.json() is intentionally registered globally here.
-// The Stripe billing webhook at /api/billing/webhook MUST override this with
+// The Paddle billing webhook at /api/billing/webhook MUST override this with
 // express.raw({ type: 'application/json' }) in billing.routes.js BEFORE the
-// signature verification middleware — otherwise Stripe sig checks will fail.
+// signature verification middleware — otherwise Paddle sig checks will fail.
 // Do NOT move or remove this global parser thinking it will "fix" billing.
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -235,7 +263,18 @@ app.get('/health', (_req, res) => {
 app.use('/api/auth/signup', authLimiter, validate(schemas.signup));
 app.use('/api/auth/login',  authLimiter, validate(schemas.login));
 app.use('/api/auth/google', authLimiter, validate(schemas.googleAuth));
+// PHASE 2: same reasoning as the three lines above — refresh and the MFA
+// verification endpoints are exactly the kind of thing you don't want
+// brute-forceable at more than 10 attempts/15min.
+app.use('/api/auth/refresh',          authLimiter);
+app.use('/api/auth/mfa/verify',       authLimiter);
+app.use('/api/auth/mfa/verify-setup', authLimiter);
+app.use('/api/auth/mfa/disable',      authLimiter);
 app.use('/api/auth',        require('./routes/auth.routes'));
+
+// PHASE 2 — Admin (user/role management, security log). Auth+role checks
+// happen inside admin.routes.js itself.
+app.use('/api/admin',       require('./routes/admin.routes'));
 
 // Data (includes authenticated file-serving endpoint — replaces public /uploads)
 // FIX: extendTimeout — large CSV/XLSX/ZIP uploads (up to 500MB) need more than 30s

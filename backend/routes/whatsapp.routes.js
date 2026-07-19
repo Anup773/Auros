@@ -47,6 +47,12 @@
  *   - All route paths unchanged (/send, /status/:jobId, /webhook)
  *   - requireAuth on /send and /status/:jobId
  *   - ctrl.sendApproval, ctrl.getStatus, ctrl.webhook method names unchanged
+ *
+ * PHASE 2 — "Webhook idempotency hardening":
+ *   _replayGuard now checks a Redis SET NX first (distributed, survives
+ *   restarts) — literally the fix this file's own FIX #2 comment already
+ *   specified — falling back to the original in-memory Map if Redis is
+ *   unavailable. No route paths, signatures, or response shapes changed.
  */
 
 const express   = require('express');
@@ -173,10 +179,17 @@ function _twilioSignatureMiddleware(req, res, next) {
 // SECTION 5 — REPLAY GUARD (FIX #2)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// NOTE: Single-process only. For multi-server, replace with:
-//   await redis.set(`whatsapp:sid:${sid}`, 1, 'EX', REPLAY_WINDOW_MS/1000, 'NX')
-//   and reject if return value is null (key already existed).
-const _seenMessageSids = new Map();  // sid → receivedAt (ms)
+// PHASE 2 — "Webhook idempotency hardening": this guard was already
+// correctly designed (MessageSid dedup, pruned window) but explicitly
+// documented as single-process only, with the exact fix already written
+// out in the comment below. This wires in that fix: an atomic Redis SET NX
+// as the primary check (works across every instance, survives restarts),
+// falling back to the original in-memory Map if Redis is unreachable — the
+// same graceful-degradation pattern already used in
+// services/payments/paddle.service.js for the same kind of webhook dedup.
+const sharedRedis = require('../config/redis');
+
+const _seenMessageSids = new Map();  // sid → receivedAt (ms) — fallback only now
 
 // Prune expired entries every REPLAY_WINDOW_MS
 const _replayPruneInterval = setInterval(() => {
@@ -188,7 +201,7 @@ const _replayPruneInterval = setInterval(() => {
 
 if (_replayPruneInterval.unref) _replayPruneInterval.unref();
 
-function _replayGuard(req, res, next) {
+async function _replayGuard(req, res, next) {
   // Twilio's unique message identifier — present in all inbound/status callbacks
   const sid = req.body?.MessageSid || req.body?.SmsSid || null;
 
@@ -197,11 +210,29 @@ function _replayGuard(req, res, next) {
     return next();
   }
 
+  const replayWindowSec = Math.max(1, Math.ceil(REPLAY_WINDOW_MS / 1000));
+
+  if (sharedRedis.isAvailable()) {
+    try {
+      // Atomic — exactly the command this file's own comment already
+      // specified: NX means "only set if it doesn't exist", so a
+      // concurrent duplicate request can never both pass this check.
+      const result = await sharedRedis.redis.set(`whatsapp:sid:${sid}`, '1', 'EX', replayWindowSec, 'NX');
+      if (result === null) {
+        console.warn(`[whatsapp.routes] Duplicate MessageSid "${sid}" rejected via Redis (replay attack or double-delivery).`);
+        return res.status(200).send('<?xml version="1.0"?><Response></Response>');
+      }
+      return next();
+    } catch (err) {
+      console.warn('[whatsapp.routes] Redis check failed for replay guard, falling back to local memory:', err.message);
+      // fall through to the local-memory check below
+    }
+  }
+
   if (_seenMessageSids.has(sid)) {
     console.warn(
-      `[whatsapp.routes] Duplicate MessageSid "${sid}" rejected (replay attack or double-delivery).`
+      `[whatsapp.routes] Duplicate MessageSid "${sid}" rejected via local memory (replay attack or double-delivery).`
     );
-    // Return 200 to Twilio so it doesn't keep retrying, but do not process
     return res.status(200).send('<?xml version="1.0"?><Response></Response>');
   }
 

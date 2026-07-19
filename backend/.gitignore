@@ -13,3 +13,33 @@ logs/
 .mypy_cache/
 coverage/
 dist/
+# Dependencies
+backend/node_modules/
+frontend/node_modules/
+
+# Environment files
+backend/.env
+frontend/.env
+
+# Runtime folders
+backend/temp/
+backend/uploads/
+outputs/
+
+# PHASE 2 — generated/sensitive, should never be committed
+backend/data/apiKeys.json
+backend/backups/
+backend/logs/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Coverage
+coverage/
+dist/

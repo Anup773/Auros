@@ -67,6 +67,7 @@ const path         = require('path');
 const fs           = require('fs');
 const crypto       = require('crypto');
 const dataAnalyzer = require('../services/data/dataAnalyzer.service');
+const s3Storage    = require('../services/storage/s3Storage.service'); // PHASE 2 — no-ops unless STORAGE_BACKEND=s3
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 1 — CONFIGURATION
@@ -102,6 +103,18 @@ function _generateDatasetId() {
   }
   // Fallback for older Node versions
   return `ds_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
+}
+
+/** PHASE 2 — best-effort content type for the S3 mirror upload (informational only). */
+function _contentTypeFor(filename) {
+  const ext = path.extname(filename).toLowerCase();
+  const map = {
+    '.csv' : 'text/csv',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.xls' : 'application/vnd.ms-excel',
+    '.xml' : 'application/xml',
+  };
+  return map[ext] || 'application/octet-stream';
 }
 
 /**
@@ -193,6 +206,7 @@ exports.uploadDataset = async (req, res, next) => {
       cleanedRows     : null,
       cleanedFilePath : null,
       uploadedAt      : new Date().toISOString(),
+      s3Key           : null, // PHASE 2: filled in below, best-effort, if S3 storage is enabled
     });
 
     const response = {
@@ -206,6 +220,27 @@ exports.uploadDataset = async (req, res, next) => {
     if (xmlWarning) response.xmlWarning = true;
 
     res.json(response);
+
+    // PHASE 2 — "S3 private storage": best-effort, fire-and-forget mirror of
+    // the uploaded file into private, encrypted S3 storage. Deliberately:
+    //   - runs AFTER the response is sent, so it can never add latency to
+    //     the upload the user is waiting on;
+    //   - never awaited by the request handler, so an S3 outage/misconfig
+    //     can never fail or slow down an upload;
+    //   - a pure ADDITION on top of the existing local-disk write, not a
+    //     replacement — the ingestion/pipeline/reconciliation code below
+    //     this still reads from `filePath` on local disk exactly as before.
+    // No-ops entirely (resolves to null immediately) unless STORAGE_BACKEND=s3
+    // is explicitly set, so this changes nothing by default.
+    if (s3Storage.isEnabled()) {
+      const s3Key = `datasets/${datasetId}/${originalName}`;
+      s3Storage.uploadFile(filePath, s3Key, _contentTypeFor(originalName))
+        .then(() => {
+          const entry = datasetRegistry.get(datasetId);
+          if (entry) entry.s3Key = s3Key;
+        })
+        .catch(err => console.warn(`[data.controller] S3 mirror upload failed for dataset ${datasetId} (local copy is unaffected):`, err.message));
+    }
   } catch (err) {
     next(err);
   }
@@ -395,4 +430,3 @@ exports.datasetRegistry = datasetRegistry;
 exports.getDataset      = getDataset;
 exports.datasetStore    = datasetRegistry;   // V2 alias for procurement.controller.js
 exports.closeRegistry   = closeRegistry;     // FIX #3: new export for graceful shutdown
-

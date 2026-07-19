@@ -29,8 +29,50 @@ const schemas = {
     password: z.string().min(1).max(128),
   }),
 
+  // PHASE 2 FIX: this schema previously only defined `accessToken`, which
+  // meant a request containing only `idToken` (the more secure,
+  // audience-validated path — see auth.controller.js's _verifyGoogleIdToken)
+  // was either rejected outright (accessToken is required) or had `idToken`
+  // silently stripped by Zod's default "strip unknown keys" behaviour before
+  // it ever reached the controller. The controller's own
+  // `if (!accessToken && !idToken)` guard already enforces that at least one
+  // is present, so both are optional here.
   googleAuth: z.object({
-    accessToken: z.string().min(10).max(2048),
+    accessToken: z.string().min(10).max(2048).optional(),
+    idToken    : z.string().min(10).max(4096).optional(),
+  }),
+
+  // PHASE 2 — session/refresh
+  refreshToken: z.object({
+    refreshToken: z.string().min(10).max(512),
+  }),
+
+  // PHASE 2 — MFA
+  mfaVerifySetup: z.object({
+    code: z.string().min(6).max(10),
+  }),
+
+  mfaDisable: z.object({
+    password: z.string().min(1).max(128).optional(),
+    code    : z.string().min(6).max(10).optional(),
+  }).refine(d => d.password || d.code, { message: 'Either password or code is required' }),
+
+  mfaVerifyChallenge: z.object({
+    challengeToken: z.string().min(10).max(256),
+    code          : z.string().min(6).max(10).optional(),
+    backupCode    : z.string().min(6).max(20).optional(),
+  }).refine(d => d.code || d.backupCode, { message: 'Either code or backupCode is required' }),
+
+  // PHASE 2 — admin role management
+  updateUserRole: z.object({
+    role: z.string().min(1).max(50),
+  }),
+
+  // PHASE 2 — API key management
+  createApiKey: z.object({
+    name         : z.string().min(1).max(100),
+    role         : z.string().min(1).max(50).optional(),
+    expiresInDays: z.number().positive().max(3650).optional(),
   }),
 
   // Procurement

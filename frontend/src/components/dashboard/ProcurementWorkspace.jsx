@@ -17,7 +17,7 @@
 
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { dataAPI, uploadAPI, procurementAPI, whatsappAPI, ocrAPI } from '../../services/api';
+import { dataAPI, uploadAPI, procurementAPI, ocrAPI } from '../../services/api';
 import UploadZone from './UploadZone';
 import Loader from '../common/Loader';
 import ErrorMessage from '../common/ErrorMessage';
@@ -95,8 +95,6 @@ export default function ProcurementWorkspace() {
   const [loadingMsg,   setLoadingMsg]   = useState('');
   const [progress,     setProgress]     = useState(null);
   const [error,        setError]        = useState('');
-  const [whatsappPhone,setWhatsappPhone]= useState('');
-  const [whatsappSent, setWhatsappSent] = useState(false);
 
   // Batch 3: optional supporting documents. Each is independent of the
   // primary invoice upload — omitting any (or all) of them reproduces the
@@ -452,32 +450,6 @@ export default function ProcurementWorkspace() {
   }));
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // WhatsApp
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  async function sendToWhatsApp() {
-    if (!whatsappPhone.trim()) return;
-    setError('');
-    const pending = (job?.pendingApprovals || []).filter(a => a.status === 'pending');
-    if (!pending.length) return;
-    try {
-      for (const approval of pending) {
-        await whatsappAPI.sendApproval(
-          whatsappPhone, jobId, approval.id,
-          approval.question?.question || approval.question,
-          approval.question?.options  || [],
-          token,
-        );
-        await _sleep(400);
-        if (!isMounted.current) return;
-      }
-      safe(setWhatsappSent)(true);
-    } catch (err) {
-      safe(setError)(err.message || 'WhatsApp send failed.');
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
   // PHASE 4 → 5 : Execute
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -534,8 +506,6 @@ export default function ProcurementWorkspace() {
     setJobId(null);
     setJob(null);
     setError('');
-    setWhatsappPhone('');
-    setWhatsappSent(false);
     setLoading(false);
     setLoadingMsg('');
     setProgress(null);
@@ -815,33 +785,6 @@ export default function ProcurementWorkspace() {
                 ? `${pendingCount} item${pendingCount > 1 ? 's' : ''} require your approval`
                 : 'All items reviewed ✓'}
             </div>
-
-            {pendingCount > 0 && (
-              <div className="proc-whatsapp-row">
-                <input
-                  className="input proc-phone-input"
-                  placeholder="+91 98765 43210 (WhatsApp)"
-                  value={whatsappPhone}
-                  onChange={e => setWhatsappPhone(e.target.value)}
-                />
-                <button
-                  className="btn-ghost proc-wa-btn"
-                  onClick={sendToWhatsApp}
-                  disabled={!whatsappPhone.trim() || whatsappSent}
-                >
-                  {whatsappSent
-                    ? `✓ Sent all ${pendingCount} items`
-                    : `📱 Send ${pendingCount} item${pendingCount > 1 ? 's' : ''} to WhatsApp`}
-                </button>
-              </div>
-            )}
-
-            {whatsappSent && (
-              <div className="proc-wa-notice">
-                All {pendingCount} approval question{pendingCount > 1 ? 's' : ''} sent to{' '}
-                {whatsappPhone}. You can also approve inline below.
-              </div>
-            )}
           </div>
 
           <ApprovalPanel

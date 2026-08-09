@@ -22,15 +22,15 @@ describe('apiKey.service', () => {
     if (fs.existsSync(REAL_DATA_FILE)) fs.unlinkSync(REAL_DATA_FILE);
   });
 
-  test('createApiKey returns a full key exactly once, prefixed for recognisability', () => {
-    const created = apiKeyService.createApiKey('user_key_1', 'Test Key', { role: 'finance' });
+  test('createApiKey returns a full key exactly once, prefixed for recognisability', async () => {
+    const created = await apiKeyService.createApiKey('user_key_1', 'Test Key', { role: 'finance' });
     assert.ok(created.key.startsWith('auros_live_'));
     assert.ok(created.keyPrefix.length < created.key.length);
     assert.equal(created.name, 'Test Key');
   });
 
   test('verifyApiKey accepts a freshly created key and resolves its owner/role', async () => {
-    const created = apiKeyService.createApiKey('user_key_2', 'Another Key', { role: 'reviewer' });
+    const created = await apiKeyService.createApiKey('user_key_2', 'Another Key', { role: 'reviewer' });
     const result = await apiKeyService.verifyApiKey(created.key);
     assert.equal(result.valid, true);
     assert.equal(result.userId, 'user_key_2');
@@ -42,8 +42,8 @@ describe('apiKey.service', () => {
     assert.equal((await apiKeyService.verifyApiKey('auros_live_nonexistent')).valid, false);
   });
 
-  test('listApiKeysForUser never exposes the hash or the full key', () => {
-    apiKeyService.createApiKey('user_key_3', 'Listable Key');
+  test('listApiKeysForUser never exposes the hash or the full key', async () => {
+    await apiKeyService.createApiKey('user_key_3', 'Listable Key');
     const list = apiKeyService.listApiKeysForUser('user_key_3');
     assert.equal(list.length, 1);
     assert.equal('keyHash' in list[0], false);
@@ -52,12 +52,12 @@ describe('apiKey.service', () => {
   });
 
   test('revokeApiKey invalidates the key and cannot be done by a different user', async () => {
-    const created = apiKeyService.createApiKey('user_key_4', 'Revoke Me');
+    const created = await apiKeyService.createApiKey('user_key_4', 'Revoke Me');
 
-    const wrongUserResult = apiKeyService.revokeApiKey('someone_else', created.id);
+    const wrongUserResult = await apiKeyService.revokeApiKey('someone_else', created.id);
     assert.equal(wrongUserResult, false);
 
-    const correctResult = apiKeyService.revokeApiKey('user_key_4', created.id);
+    const correctResult = await apiKeyService.revokeApiKey('user_key_4', created.id);
     assert.equal(correctResult, true);
 
     const verifyAfter = await apiKeyService.verifyApiKey(created.key);
@@ -66,10 +66,20 @@ describe('apiKey.service', () => {
   });
 
   test('an expired key is rejected', async () => {
-    const created = apiKeyService.createApiKey('user_key_5', 'Expires Immediately', { expiresInDays: 0.0000001 });
+    const created = await apiKeyService.createApiKey('user_key_5', 'Expires Immediately', { expiresInDays: 0.0000001 });
     await new Promise(r => setTimeout(r, 50));
     const result = await apiKeyService.verifyApiKey(created.key);
     assert.equal(result.valid, false);
     assert.equal(result.reason, 'EXPIRED');
+  });
+
+  test('lastUsedAt updates in memory immediately even though the disk write is debounced', async () => {
+    const created = await apiKeyService.createApiKey('user_key_6', 'Debounce Check');
+    assert.equal(apiKeyService.listApiKeysForUser('user_key_6')[0].lastUsedAt, null);
+
+    await apiKeyService.verifyApiKey(created.key);
+
+    const afterUse = apiKeyService.listApiKeysForUser('user_key_6')[0];
+    assert.notEqual(afterUse.lastUsedAt, null);
   });
 });

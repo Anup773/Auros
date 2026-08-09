@@ -305,13 +305,6 @@ export const procurementAPI = {
     request('GET', `/api/procurement/${jobId}/audit?format=${format}`, null, token),
 };
 
-export const whatsappAPI = {
-  sendApproval: (toPhone, jobId, approvalId, question, options, token) =>
-    request('POST', '/api/whatsapp/send', { toPhone, jobId, approvalId, question, options }, token),
-  getStatus: (jobId, token) =>
-    request('GET', `/api/whatsapp/status/${jobId}`, null, token),
-};
-
 export const billingAPI = {
   getPlans          : (token)         => request('GET',  '/api/billing/plans',        null,      token),
   createCheckout    : (planId, token) => request('POST', '/api/billing/checkout',      { planId }, token),
@@ -319,3 +312,4 @@ export const billingAPI = {
   cancelSubscription: (token)         => request('POST', '/api/billing/cancel',        {},        token),
   getPortalUrl      : (token)         => request('GET',  '/api/billing/portal',        null,      token),
 };
+

@@ -3,7 +3,7 @@ import React, { createContext, useContext, useState } from 'react';
 /**
  * DashboardContext
  * Manages which mode the dashboard is in:
- *   - 'general'     : General AI data cleaning
+ *   - 'general'     : General AI data cleaning (retired — see ModeSelector removal)
  *   - 'procurement' : Invoice reconciliation
  */
 const DashboardContext = createContext(null);
@@ -14,7 +14,7 @@ export const MODES = {
 };
 
 export function DashboardProvider({ children }) {
-  const [mode, setMode] = useState(MODES.GENERAL);
+  const [mode, setMode] = useState(MODES.PROCUREMENT);
 
   return (
     <DashboardContext.Provider value={{ mode, setMode, MODES }}>

@@ -17,7 +17,7 @@
  * Requires the SAME BACKUP_ENCRYPTION_KEY used to create the backup.
  */
 
-const { execFileSync } = require('child_process');
+const tar    = require('tar');
 const crypto = require('crypto');
 const fs     = require('fs');
 const path   = require('path');
@@ -58,7 +58,7 @@ function decryptFile(inputPath, outputPath) {
   }
 }
 
-function main() {
+async function main() {
   if (!fs.existsSync(inputArg)) fail(`File not found: ${inputArg}`);
 
   const tmpTar = path.join(BACKEND_ROOT, `.restore-tmp-${Date.now()}.tar.gz`);
@@ -68,12 +68,12 @@ function main() {
 
   if (forceRestore) {
     console.log('[restore] --force-restore passed: extracting DIRECTLY into backend/, overwriting data/logs/uploads if present.');
-    execFileSync('tar', ['-xzf', tmpTar, '-C', BACKEND_ROOT]);
+    await tar.extract({ file: tmpTar, cwd: BACKEND_ROOT });
     console.log('[restore] Restored in place. Restart the server for it to pick up the restored data/*.json files.');
   } else {
     const outDir = path.join(BACKEND_ROOT, `restored-${new Date().toISOString().replace(/[:.]/g, '-')}`);
-    fs.mkdirSync(outDir, { recursive: true });
-    execFileSync('tar', ['-xzf', tmpTar, '-C', outDir]);
+    fs.mkdirSync(outDir, { recursive: true }); // tar.extract requires cwd to already exist
+    await tar.extract({ file: tmpTar, cwd: outDir });
     console.log(`[restore] Extracted to: ${outDir}`);
     console.log('[restore] Nothing live was touched. Inspect the folder above, then either copy files in manually or re-run with --force-restore.');
   }
@@ -81,4 +81,4 @@ function main() {
   fs.unlinkSync(tmpTar);
 }
 
-main();
+main().catch(err => fail(err.message));

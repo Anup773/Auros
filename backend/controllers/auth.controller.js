@@ -182,15 +182,32 @@ function loadUsers() {
   }
 }
 
-// FIX #8: Atomic write via temp file + rename
+// FIX #8 (preserved): atomic write via temp file + rename.
+// PHASE 2 (post-review) FIX: this was synchronous (fs.writeFileSync/
+// renameSync), blocking the event loop on every signup, login (MFA state
+// save), admin action, and API key change — and racing on concurrent calls,
+// where whichever write finished last would silently overwrite the other's
+// changes. Same fix as apiKey.service.js's _save/_doSave: async fs.promises
+// I/O, serialized through a queue so concurrent calls can never race.
+// Callers now `await saveUsers()`, preserving the same durability guarantee
+// (the response still isn't sent until the write completes) without
+// blocking other requests while it's in flight.
+const fsp = fs.promises;
+let _userSaveQueue = Promise.resolve();
+
 function saveUsers() {
+  _userSaveQueue = _userSaveQueue.then(_doSaveUsers, _doSaveUsers);
+  return _userSaveQueue;
+}
+
+async function _doSaveUsers() {
   try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(DATA_DIR)) await fsp.mkdir(DATA_DIR, { recursive: true });
     const obj     = {};
     const tmpFile = DATA_FILE + '.tmp';
     for (const [k, v] of userStore.entries()) obj[k] = v;
-    fs.writeFileSync(tmpFile, JSON.stringify(obj, null, 2), 'utf8');
-    fs.renameSync(tmpFile, DATA_FILE);  // FIX #8: atomic on POSIX
+    await fsp.writeFile(tmpFile, JSON.stringify(obj, null, 2), 'utf8');
+    await fsp.rename(tmpFile, DATA_FILE);  // FIX #8: atomic on POSIX
   } catch (e) {
     console.error('[auth] Failed to save users:', e.message);
   }
@@ -243,7 +260,7 @@ exports.signup = async (req, res, next) => {
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
     const user = assignDefaultRole({
-      id          : `user_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+      id          : `user_${crypto.randomUUID()}`,
       name        : name.trim().slice(0, 100),
       email       : emailKey,
       passwordHash,
@@ -253,7 +270,7 @@ exports.signup = async (req, res, next) => {
 
     userStore.set(emailKey, user);
     _userByIdStore.set(user.id, user);  // FIX #2: keep id index in sync
-    saveUsers();
+    await saveUsers();
 
     // PHASE 2: sessionStore issues an access+refresh pair (Redis-backed,
     // survives restarts and works across multiple instances) in place of the
@@ -358,7 +375,7 @@ exports.googleAuth = async (req, res, next) => {
     if (!user) {
       isNewUser = true;
       user = assignDefaultRole({
-        id          : `user_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+        id          : `user_${crypto.randomUUID()}`,
         name        : (googleUser.name || googleUser.email.split('@')[0]).slice(0, 100),
         email       : emailKey,
         passwordHash: null,
@@ -368,7 +385,7 @@ exports.googleAuth = async (req, res, next) => {
       });
       userStore.set(emailKey, user);
       _userByIdStore.set(user.id, user);  // FIX #2
-      saveUsers();
+      await saveUsers();
       console.log(`[auth] Google signup: ${user.email}`);
     } else {
       console.log(`[auth] Google login: ${user.email}`);

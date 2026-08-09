@@ -7,7 +7,6 @@
  *   - mfa.service.js           (MFA login-challenge state)
  *   - apiKey.service.js        (rate/usage counters — the keys themselves live on disk, see apiKey.service.js)
  *   - securityLogger.service.js (nothing stored here — stdout/disk only — but shares the module for consistency)
- *   - whatsapp.routes.js       (Redis-backed replay guard, replacing the in-memory Map)
  *
  * This intentionally does NOT touch queues/jobQueue.js, services/payments/paddle.service.js,
  * or services/procurement/reconciliationEngine.service.js — those already each own a working

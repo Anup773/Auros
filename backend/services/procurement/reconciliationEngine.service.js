@@ -60,6 +60,7 @@ const fs     = require('fs');
 const crypto = require('crypto');
 const { callEngine } = require('../pythonBridge.service');
 const audit  = require('../../audit/auditLogger.service');
+const approvalRules = require('./approvalRules.service');
 
 const OUTPUT_DIR = path.join(__dirname, '../../../outputs');
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -365,6 +366,53 @@ const _cleanupInterval = setInterval(() => {
 }, 30 * 60 * 1000);
 
 if (_cleanupInterval.unref) _cleanupInterval.unref();
+
+// PHASE 2 (post-review) FIX — OUTPUT_DIR WAS NEVER CLEANED (data retention gap)
+//   Old: a completed job's reconciled output file (the actual matched
+//        invoice/PO result — the most sensitive artifact this app produces)
+//        was written to OUTPUT_DIR and never deleted by any code path. The
+//        job's own tracking record expires after JOB_EXPIRY_MS (so the file
+//        becomes unreachable via the download endpoint at that point
+//        anyway — controllers/procurement.controller.js's download route
+//        needs the job record to know outputPath), but the file itself just
+//        sat on disk indefinitely afterward.
+//   New: same proven pattern already used for backend/uploads/ in
+//        routes/data.routes.js — a periodic sweep that deletes files in
+//        OUTPUT_DIR older than OUTPUT_FILE_TTL_MS, based on the file's own
+//        mtime rather than in-memory job state. This is deliberately NOT
+//        tied to _localJobCache (that's a per-instance memory cache and
+//        would miss output files from jobs handled by a different server
+//        instance); a filesystem-mtime sweep works correctly on any
+//        instance as long as OUTPUT_DIR is on shared/persistent storage
+//        (e.g. an EFS mount across instances), which is the same
+//        architecture already recommended for multi-instance deployments.
+const OUTPUT_FILE_TTL_MS = parseInt(process.env.OUTPUT_FILE_TTL_HOURS || '24', 10) * 60 * 60 * 1000;
+
+function _cleanupOutputDir() {
+  const now = Date.now();
+  let   removed = 0;
+  try {
+    for (const entry of fs.readdirSync(OUTPUT_DIR)) {
+      const fullPath = path.join(OUTPUT_DIR, entry);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (stat.isFile() && (now - stat.mtimeMs) > OUTPUT_FILE_TTL_MS) {
+          fs.unlinkSync(fullPath);
+          removed++;
+        }
+      } catch (_) { /* file may have been deleted between readdir and stat */ }
+    }
+    if (removed > 0) {
+      console.log(`[reconciliationEngine] Cleaned ${removed} expired output file(s) from ${OUTPUT_DIR}`);
+    }
+  } catch (err) {
+    console.warn('[reconciliationEngine] Output cleanup error:', err.message);
+  }
+}
+
+_cleanupOutputDir();
+const _outputCleanupInterval = setInterval(_cleanupOutputDir, 60 * 60 * 1000);
+if (_outputCleanupInterval.unref) _outputCleanupInterval.unref();
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 5 — PUBLIC API: startReconciliation
@@ -751,23 +799,34 @@ async function _applyReconcileResult(jobId, engineResult) {
   if (!job) return;
 
   const recon = engineResult.reconciliation;
+  const ambiguities = recon.ambiguities || [];
 
-  const pendingApprovals = (recon.ambiguities || []).map((amb, i) => ({
-    id            : `appr_${jobId}_${i}`,
-    questionIndex : i,
-    type          : amb.type,
-    status        : 'pending',
-    lockedBy      : null,
-    lockedAt      : null,
-    lockedUntil   : null,
-    question      : { question: amb.question, options: amb.options || [] },
-    response      : null,
-    respondedVia  : null,
-    riskLevel     : amb.severity === 'High' ? 'High' : 'Medium',
-    affectedRows  : 1,
-    createdAt     : new Date().toISOString(),
-    resolvedAt    : null,
-  }));
+  // PHASE 3 — criteria-based auto-approval. Evaluated once per ambiguity as
+  // the approval item is built, using whatever rules are currently
+  // configured (see approvalRules.service.js for the matching logic and
+  // the safety defaults — duplicate_invoice can never match).
+  const rules = await approvalRules.listRules();
+
+  const pendingApprovals = ambiguities.map((amb, i) => {
+    const matchedRule = approvalRules.findMatchingRule(amb, rules);
+    return {
+      id            : `appr_${jobId}_${i}`,
+      questionIndex : i,
+      type          : amb.type,
+      status        : 'pending',
+      lockedBy      : null,
+      lockedAt      : null,
+      lockedUntil   : null,
+      question      : { question: amb.question, options: amb.options || [] },
+      response      : null,
+      respondedVia  : null,
+      riskLevel     : amb.severity === 'High' ? 'High' : 'Medium',
+      affectedRows  : 1,
+      createdAt     : new Date().toISOString(),
+      resolvedAt    : null,
+      matchedRule   : matchedRule ? { id: matchedRule.id, name: matchedRule.name } : null,
+    };
+  });
 
   await _updateJob(jobId, {
     status          : 'awaiting_approvals',
@@ -775,6 +834,21 @@ async function _applyReconcileResult(jobId, engineResult) {
     pendingApprovals,
     warnings        : engineResult.warnings || [],
   });
+
+  // Auto-approve every rule-matched item through the SAME approveItem() a
+  // human click uses — identical audit trail (respondedVia distinguishes
+  // 'auto_rule' from 'dashboard'), identical state transition, identical
+  // downstream effects. Rules only decide WHETHER to approve; approveItem
+  // still decides HOW.
+  for (const item of pendingApprovals) {
+    if (!item.matchedRule) continue;
+    const defaultResponse = item.question.options[0] || 'Approved';
+    try {
+      await approveItem(jobId, item.id, defaultResponse, 'auto_rule', null);
+    } catch (err) {
+      console.error(`[reconciliationEngine] Auto-approval failed for ${item.id} (rule ${item.matchedRule.id}):`, err.message);
+    }
+  }
 
   _safeAudit(() => audit.logIngestion(job.jobId, job.userId, {
     sourceFile: path.basename(job.invoiceFilePath),
@@ -1111,6 +1185,7 @@ async function executeReconciliation(jobId) {
 
 async function closeConnections() {
   clearInterval(_cleanupInterval);
+  clearInterval(_outputCleanupInterval);
   const closers = [];
   if (_redisClient) closers.push(_redisClient.quit().catch(() => {}));
   if (_subRedis)    closers.push(_subRedis.quit().catch(() => {}));
@@ -1178,4 +1253,3 @@ module.exports = {
   cancelJob,
   closeConnections,
 };
-

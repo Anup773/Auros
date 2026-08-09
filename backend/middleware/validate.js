@@ -133,15 +133,6 @@ const schemas = {
     ),
     originalName: z.string().min(1).max(255),
   }),
-
-  // WhatsApp
-  sendWhatsApp: z.object({
-    toPhone    : z.string().min(7).max(20).regex(/^\+?[\d\s\-()]+$/),
-    jobId      : z.string().min(1).max(100),
-    approvalId : z.string().min(1).max(100),
-    question   : z.string().min(1).max(1000),
-    options    : z.array(z.string().max(200)).max(10),
-  }),
 };
 
 // ── Middleware factory ────────────────────────────────────────────────────────

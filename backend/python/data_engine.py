@@ -1225,6 +1225,19 @@ def match_invoices_to_pos(invoices: list, pos: list) -> list:
     # Fix: match invoice.po_number against po.po_number (the correct field
     # on both sides), matching the design already documented — but never
     # wired up — in services/procurement/poMatcher.service.js.
+    #
+    # BUGFIX (round 2): po_by_number mapped po_number -> a single PO row,
+    # so a multi-line PO (several rows legitimately sharing the same
+    # po_number — one row per item, completely normal) had every row but
+    # the last silently overwritten in this dict. Every invoice line for
+    # that PO then matched against whichever PO line happened to be
+    # processed last, regardless of which item it actually corresponded
+    # to — e.g. an invoice line for "Steel Brackets" could get compared
+    # against a PO line for "Aluminum Rods" purely because they shared a
+    # PO number. Fixed by keeping every PO line per po_number and, when a
+    # PO has more than one line, picking the candidate whose amount is
+    # closest to the invoice line's amount — the correct line, not
+    # whichever was inserted last.
     matches = []
     if not pos:
         return matches
@@ -1233,7 +1246,7 @@ def match_invoices_to_pos(invoices: list, pos: list) -> list:
     for po in pos:
         num = _get_po_number(po)
         if num:
-            po_by_number[num.upper().strip()] = po
+            po_by_number.setdefault(num.upper().strip(), []).append(po)
 
     vendor_index = _build_vendor_index(pos) if HAS_RAPIDFUZZ else {}
 
@@ -1245,8 +1258,9 @@ def match_invoices_to_pos(invoices: list, pos: list) -> list:
         amount_diff     = 0.0
         amount_diff_pct = 0.0
 
-        if inv_po_num and inv_po_num.upper().strip() in po_by_number:
-            matched_po = po_by_number[inv_po_num.upper().strip()]
+        candidates = po_by_number.get(inv_po_num.upper().strip()) if inv_po_num else None
+        if candidates:
+            matched_po = _best_amount_match(candidates, inv_amount)
             match_type = "po_number"
         elif HAS_RAPIDFUZZ:
             vendor_name = _get_vendor_name(inv)
@@ -1275,6 +1289,28 @@ def match_invoices_to_pos(invoices: list, pos: list) -> list:
             })
 
     return matches
+
+
+def _best_amount_match(candidates: list, inv_amount):
+    """
+    Given several PO lines that share the same po_number (a normal
+    multi-line PO), pick the one whose amount is closest to the invoice
+    line's amount. Falls back to the first candidate if amounts aren't
+    available on either side — same as the single-candidate behavior
+    this replaces, just extended to disambiguate when there's more than one.
+    """
+    if len(candidates) == 1 or inv_amount is None:
+        return candidates[0]
+
+    best, best_diff = candidates[0], None
+    for po in candidates:
+        po_amount = _parse_amount(po)
+        if po_amount is None:
+            continue
+        diff = abs(inv_amount - po_amount)
+        if best_diff is None or diff < best_diff:
+            best, best_diff = po, diff
+    return best
 
 
 def match_grn_to_pos(grn_rows: list) -> dict:
@@ -1321,24 +1357,46 @@ def build_contract_index(contract_rows: list) -> dict:
 
 
 def detect_invoice_duplicates(invoices: list) -> dict:
+    """
+    BUGFIX: previously grouped rows by invoice_number alone and flagged any
+    group of 2+ as a duplicate. That's wrong for the extremely common case
+    of a normal multi-line invoice — one real invoice, several line items,
+    all correctly sharing the same invoice_number — which this flagged as
+    "duplicate" every single time, a false positive on completely ordinary
+    data. A genuine duplicate is the SAME LINE (same item/qty/amount)
+    appearing more than once under the same invoice number, not merely
+    multiple distinct lines sharing that number.
+    """
     groups = []
     count  = 0
-    seen: dict = {}
+    by_number: dict = {}
     for inv in invoices:
         num = _get_invoice_number(inv)
         if num:
-            key = num.upper().strip()
-            seen.setdefault(key, []).append(inv)
+            by_number.setdefault(num.upper().strip(), []).append(inv)
 
-    for key, group in seen.items():
-        if len(group) > 1:
-            count += len(group) - 1
-            groups.append({
-                "type"    : "exact_invoice_number",
-                "invoices": group,
-                "message" : f"Invoice number {key!r} appears {len(group)} times.",
-                "severity": "High",
-            })
+    for key, candidates in by_number.items():
+        if len(candidates) < 2:
+            continue
+        # Within this invoice number, group again by the line's own content
+        # (excluding bookkeeping fields) — only an EXACT repeat of the same
+        # line is a real duplicate.
+        by_line: dict = {}
+        for inv in candidates:
+            line_key = tuple(sorted(
+                (k, str(v)) for k, v in inv.items() if k not in ('_raw', '_rowIndex')
+            ))
+            by_line.setdefault(line_key, []).append(inv)
+
+        for line_group in by_line.values():
+            if len(line_group) > 1:
+                count += len(line_group) - 1
+                groups.append({
+                    "type"    : "exact_invoice_number",
+                    "invoices": line_group,
+                    "message" : f"Invoice number {key!r} has the same line submitted {len(line_group)} times.",
+                    "severity": "High",
+                })
 
     return {"count": count, "groups": groups}
 
@@ -1424,10 +1482,11 @@ def build_reconciliation(invoices: list, matches: list, duplicates: dict,
                 "diff"    : match["amountDiff"],
             })
             ambiguities.append({
-                "type"    : "amount_mismatch",
-                "invoice" : inv,
-                "po"      : match["po"],
-                "severity": severity,
+                "type"          : "amount_mismatch",
+                "invoice"       : inv,
+                "po"            : match["po"],
+                "severity"      : severity,
+                "amountDiffPct" : match["amountDiffPct"],
                 "question": (
                     f"{_priority_label(inv_amount)}"
                     f"Invoice \"{_get_invoice_number(inv) or 'UNKNOWN'}\" amount is "
@@ -1674,16 +1733,30 @@ def write_csv(rows: list, output_path: str):
 
 def _normalise_row(row: dict) -> dict:
     aliases = {
+        # BUGFIX: "invoice_id"/"po_id" (extremely common column names — e.g.
+        # this exact codebase's own test fixture uses "Invoice_ID") were
+        # never recognized as aliases here. Any invoice/PO file using an
+        # "…_ID" naming convention instead of "…_number" silently failed
+        # invoice-number-based duplicate detection (detect_invoice_duplicates
+        # groups by this field) and PO-number matching — not because either
+        # was broken, but because _get_invoice_number()/_get_po_number()
+        # found nothing under their expected keys and returned "" for every
+        # row, so no two rows were ever recognized as sharing a number.
         "invoice_number": ["invoicenumber", "invoice_no", "inv_no", "invno",
-                            "invoice #", "invoice#", "invoice number"],
+                            "invoice #", "invoice#", "invoice number",
+                            "invoice_id", "invoiceid", "inv_id", "invid",
+                            "inv_number", "invnumber", "bill_number", "billno"],
         "vendor_name"   : ["vendorname", "vendor", "supplier", "supplier_name",
-                            "suppliername", "company"],
+                            "suppliername", "company", "company_name", "companyname",
+                            "seller", "seller_name"],
         "amount"        : ["invoiceamount", "invoice_amount", "total", "total_amount",
-                            "totalamount", "amt", "value"],
+                            "totalamount", "amt", "value", "grand_total", "grandtotal",
+                            "net_amount", "netamount", "invoice_total", "invoicetotal"],
         "po_number"     : ["ponumber", "po_no", "purchase_order", "purchaseorder",
-                            "po number", "po#"],
+                            "po number", "po#", "po_id", "poid", "purchase_order_number",
+                            "purchaseordernumber", "order_number", "orderno"],
         "date"          : ["invoicedate", "invoice_date", "date_of_invoice"],
-        "currency"      : ["cur", "curr", "currency_code"],
+        "currency"      : ["cur", "curr", "currency_code", "ccy"],
         # Point 2 fix: tax was only ever populated for OCR-scanned invoices
         # (invoice_parser.py extracts it directly). CSV/XLSX invoices had no
         # alias mapping at all, so `tax` was silently absent for the vast
@@ -1693,9 +1766,10 @@ def _normalise_row(row: dict) -> dict:
         # Batch 3: shared by invoices (billed qty), POs (ordered qty), and
         # GRN rows (received qty) — all normalised through this same table.
         "quantity"      : ["qty", "quantity_received", "quantity_ordered",
-                            "units", "unit_qty", "received_qty"],
+                            "units", "unit_qty", "received_qty", "qty_ordered",
+                            "quantity_billed", "billed_qty"],
         "unit_price"    : ["unitprice", "unit_cost", "price_per_unit",
-                            "contracted_rate", "contract_price", "rate"],
+                            "contracted_rate", "contract_price", "rate", "price"],
     }
 
     normalised = {}

@@ -34,14 +34,6 @@
  *        NOTE: app.js already applies a global limiter — these are stricter
  *        per-route limits on top of that.
  *
- * MEDIUM FIX #3 — /send-whatsapp RATE LIMIT (Twilio cost protection)
- *   Old: No rate limit on WhatsApp send — attackers could trigger unlimited
- *        Twilio SMS messages at the operator's expense.
- *   New: _whatsappLimiter = 20 requests per 10 minutes per IP applied to any
- *        route that triggers outbound messaging.
- *        Note: the WhatsApp routes are in whatsapp.routes.js; this procurement
- *        router protects the procurement-layer trigger only.
- *
  * PRESERVED FROM V2:
  *   - All route paths unchanged
  *   - All RBAC middleware unchanged (requireReviewer, requireFinance)
@@ -104,6 +96,14 @@ router.get('/', requireAuth, ctrl.listJobs);
 
 // ── Start reconciliation ──────────────────────────────────────────────────────
 router.post('/reconcile', requireAuth, requireFinance, validate(schemas.startReconciliation), ctrl.startReconciliation);
+
+// ── Approval rules (criteria-based auto-approval) ─────────────────────────────
+// Registered BEFORE the /:jobId wildcard below — Express matches routes in
+// registration order, and /:jobId would otherwise treat "rules" as a jobId.
+router.get('/rules', requireAuth, requireFinance, ctrl.listApprovalRules);
+router.post('/rules', requireAuth, requireFinance, ctrl.createApprovalRule);
+router.patch('/rules/:ruleId', requireAuth, requireFinance, ctrl.updateApprovalRule);
+router.delete('/rules/:ruleId', requireAuth, requireFinance, ctrl.deleteApprovalRule);
 
 // ── Get job ───────────────────────────────────────────────────────────────────
 router.get('/:jobId', requireAuth, ctrl.getJob);

@@ -57,7 +57,6 @@ const PLANS = {
       'Up to 5,000 invoices/month',
       'All Starter features',
       'PDF & image OCR',
-      'WhatsApp approvals',
       'Audit trails',
       'Priority support',
     ],

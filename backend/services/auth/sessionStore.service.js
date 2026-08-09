@@ -136,11 +136,12 @@ function _enforceLocalCap(map) {
 }
 
 // ── Internal: write a session's three records everywhere ─────────────────────
-async function _persistSession({ sessionId, userId, accessToken, refreshToken, ip, userAgent, createdAt, replacesRefreshHash }) {
+async function _persistSession({ sessionId, userId, accessToken, refreshToken, ip, userAgent, createdAt, now, replacesRefreshHash }) {
   const accessHash  = _hash(accessToken);
   const refreshHash = _hash(refreshToken);
-  const accessExpiresAt  = createdAt + ACCESS_TOKEN_TTL_MS;
-  const refreshExpiresAt = createdAt + REFRESH_TOKEN_TTL_MS;
+  const referenceTime    = now ?? createdAt;
+  const accessExpiresAt  = referenceTime + ACCESS_TOKEN_TTL_MS;
+  const refreshExpiresAt = referenceTime + REFRESH_TOKEN_TTL_MS;
 
   // Local mirror (always — this is what keeps single-instance behaviour
   // working even when Redis is never configured).
@@ -348,7 +349,7 @@ async function rotateRefreshToken(rawRefreshToken, meta = {}) {
     sessionId: record.sessionId, userId: record.userId,
     accessToken: newAccessToken, refreshToken: newRefreshToken,
     ip: meta.ip || session.ip, userAgent: meta.userAgent || session.userAgent,
-    createdAt: now, replacesRefreshHash: hash,
+    createdAt: session.createdAt, now, replacesRefreshHash: hash,
   });
 
   // Invalidate any positive-cache entry for the OLD access token tied to this

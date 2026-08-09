@@ -11,9 +11,9 @@ const router     = express.Router();
 const authCtrl   = require('../controllers/auth.controller');
 const adminCtrl  = require('../controllers/admin.controller');
 const { requireAdmin } = require('../middleware/rbac');
-const { validate, schemas } = require('../middleware/validate');
+const { validate, schemas, sanitiseParams } = require('../middleware/validate');
 
-router.use(authCtrl.requireAuth, requireAdmin);
+router.use(authCtrl.requireAuth, requireAdmin, sanitiseParams);
 
 router.get   ('/users',              adminCtrl.listUsers);
 router.patch ('/users/:id/role',     validate(schemas.updateUserRole), adminCtrl.updateUserRole);

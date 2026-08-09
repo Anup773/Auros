@@ -604,6 +604,13 @@
 }
 .lp-pricing-card__btn { width: 100%; justify-content: center; }
 
+.lp-pricing-card__note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #64748b;
+  text-align: center;
+}
+
 /* ── CTA banner ──────────────────────────────────────────────────────────────── */
 .lp-cta {
   padding: 100px 0;

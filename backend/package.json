@@ -1,7 +1,7 @@
 {
   "name": "auros-backend",
   "version": "2.2.0",
-  "description": "Auros — AI-powered procurement reconciliation and data cleaning platform",
+  "description": "Auros — Backend System Automated procurement reconciliation and data cleaning platform",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -12,8 +12,9 @@
     "lint": "eslint . --ext .js",
     "backup": "node scripts/backup.js",
     "restore": "node scripts/restore.js",
+    "set-role": "node scripts/set-role.js",
     "py:install": "pip install -r python/requirements.txt --break-system-packages",
-    "py:check": "python3 python/data_engine.py < /dev/null || true"
+    "py:check": "node -e \"require('child_process').spawnSync(process.env.PYTHON_BIN||'python3',['python/data_engine.py'],{stdio:['ignore','inherit','inherit']})\""
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1085.0",
@@ -26,6 +27,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "express-rate-limit": "^7.5.0",
+    "google-auth-library": "^10.9.1",
     "helmet": "^8.0.0",
     "ioredis": "^5.3.2",
     "multer": "^2.1.1",
@@ -33,7 +35,7 @@
     "otplib": "^13.4.1",
     "papaparse": "^5.5.3",
     "qrcode": "^1.5.4",
-    "twilio": "^6.0.2",
+    "tar": "^7.5.22",
     "xlsx": "^0.18.5",
     "zod": "^3.25.0"
   },

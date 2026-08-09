@@ -101,13 +101,14 @@ router.post(
       return res.status(400).json({ error: 'Invalid JSON in webhook body' });
     }
 
-    // Always respond 200 quickly — process async
-    res.status(200).json({ received: true });
-
-    // Process event after responding (non-blocking)
-    paddle.processWebhookEvent(event).catch(err => {
+    try {
+      await paddle.processWebhookEvent(event);
+      res.status(200).json({ received: true });
+    } catch (err) {
       console.error('[billing] Webhook processing error:', err.message);
-    });
+      // Do NOT respond 200 — let Paddle retry a genuinely failed attempt.
+      res.status(500).json({ error: 'Processing failed' });
+    }
   }
 );
 

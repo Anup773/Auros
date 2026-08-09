@@ -23,7 +23,6 @@ const FEATURE_ICONS = {
   'AI reconciliation'         : '🤖',
   'Voice commands'            : '🎙️',
   'PDF & image OCR'           : '🔍',
-  'WhatsApp approvals'        : '📱',
   'Audit trails'              : '📋',
   'Priority support'          : '⚡',
   'Email support'             : '📧',
@@ -358,7 +357,7 @@ const FAQ_ITEMS = [
   },
   {
     q: 'Is there a free trial?',
-    a: 'Yes — paid plans include a 14-day free trial. No credit card required to start.',
+    a: 'Yes — paid plans include a 3-day free trial. A card is required to start; you won\'t be charged until the trial ends.',
   },
   {
     q: 'What payment methods do you accept?',

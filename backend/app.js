@@ -131,6 +131,13 @@ const PROCUREMENT_ROUTE_TIMEOUT_MS = parseInt(process.env.PROCUREMENT_ROUTE_TIME
 // ── Trust proxy ───────────────────────────────────────────────────────────────
 if (process.env.TRUST_PROXY === 'true') {
   app.set('trust proxy', 1);
+} else if (process.env.NODE_ENV === 'production') {
+  console.warn(
+    '[app] WARNING: NODE_ENV=production but TRUST_PROXY is not "true". ' +
+    'If this app is running behind a load balancer/reverse proxy (e.g. AWS ALB), ' +
+    'rate limiting will incorrectly apply to ALL users combined instead of per-user. ' +
+    'Set TRUST_PROXY=true if this is behind a proxy.'
+  );
 }
 
 // ── Ensure required directories exist (non-fatal on read-only FS) ─────────────
@@ -193,6 +200,19 @@ app.use(cors({
     if (isAllowed) return callback(null, true);
     callback(new Error(`CORS: origin ${origin} not allowed`));
   },
+  // NOTE ON CSRF: this app authenticates via a Bearer token in the
+  // Authorization header (never a cookie), which is why there's no CSRF
+  // middleware anywhere in this codebase — CSRF specifically exploits
+  // browsers automatically attaching cookies to cross-site requests, and a
+  // Bearer token in a header is never sent automatically. `credentials: true`
+  // below only affects whether the BROWSER exposes the response to JS
+  // across origins — it does not create a CSRF risk by itself, as long as
+  // auth stays Bearer-token-only. IF refresh tokens (or anything else
+  // auth-related) are ever moved into an httpOnly cookie (a common
+  // "more secure than localStorage" pattern), CSRF protection (e.g. a
+  // double-submit-cookie pattern, or the `csurf` middleware) MUST be added
+  // at that time — that change would silently reintroduce the exact attack
+  // this app is currently immune to.
   credentials   : true,
   methods       : ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -205,9 +225,9 @@ app.use(globalLimiter);
 // ── Compression (gzip) ────────────────────────────────────────────────────────
 // FIX: exclude the Paddle webhook path — raw body must be preserved for sig verification
 app.use(compression({
-  filter: (req) => {
+  filter: (req, res) => {
     if (req.path && req.path.startsWith('/api/billing/webhook')) return false;
-    return compression.filter(req, req.res);
+    return compression.filter(req, res);
   },
 }));
 
@@ -255,6 +275,21 @@ app.get('/health', (_req, res) => {
   });
 });
 
+// /health/ready checks Redis so a load balancer can distinguish "process is
+// alive" from "the app can actually serve traffic correctly". Redis being
+// down doesn't mean the app is fully down (everything degrades gracefully
+// by design), so this still returns 200 with a warning rather than 503,
+// UNLESS you want your load balancer to actively route away from a
+// degraded instance — in that case, point your health check at this path
+// instead of /health and treat status !== 'ok' as unhealthy.
+app.get('/health/ready', (_req, res) => {
+  const redisOk = require('./config/redis').isAvailable();
+  res.json({
+    status: redisOk ? 'ok' : 'degraded',
+    checks: { redis: redisOk ? 'ok' : 'unreachable' },
+  });
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // ROUTES
 // ═════════════════════════════════════════════════════════════════════════════
@@ -296,9 +331,6 @@ app.use('/api/upload',      uploadLimiter, extendTimeout(UPLOAD_ROUTE_TIMEOUT_MS
 // Procurement
 // FIX: extendTimeout — reconcile/execute can legitimately run for minutes on large invoice sets
 app.use('/api/procurement', sanitiseParams, extendTimeout(PROCUREMENT_ROUTE_TIMEOUT_MS), require('./routes/procurement.routes'));
-
-// WhatsApp
-app.use('/api/whatsapp',    require('./routes/whatsapp.routes'));
 
 // OCR
 // FIX: extendTimeout — OCR can legitimately take up to OCR_PYBRIDGE_TIMEOUT_MS (320s) server-side

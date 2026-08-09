@@ -8,5 +8,14 @@
     "googleId": "117465023424326261263",
     "createdAt": "2026-06-09T05:45:10.023Z",
     "role": "finance"
+  },
+  "heartandart01@gmail.com": {
+    "id": "user_c08f1645-c1da-4586-89c0-f8685ec59f55",
+    "name": "Anup",
+    "email": "heartandart01@gmail.com",
+    "passwordHash": "$2a$12$MecO03Ghu5/ESXcZaj4mUuGane2DykhziGhkwslMmN84qKKyWR1kO",
+    "provider": "email",
+    "createdAt": "2026-08-02T05:21:32.381Z",
+    "role": "admin"
   }
 }

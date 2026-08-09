@@ -61,6 +61,8 @@
 const path   = require('path');
 const engine = require('../services/procurement/reconciliationEngine.service');
 const audit  = require('../audit/auditLogger.service');
+const approvalRules = require('../services/procurement/approvalRules.service');
+const securityLogger = require('../audit/securityLogger.service');
 
 // [AUDIT #4] Controller-level cap — mirrors engine constant, enforced here first.
 const MAX_BULK_APPROVALS = 500;
@@ -407,3 +409,46 @@ function _resolveDatasetPath(datasetId, req) {
     return null;
   }
 }
+
+// ── Approval rules (criteria-based auto-approval) ─────────────────────────────
+
+exports.listApprovalRules = async (req, res, next) => {
+  try {
+    const rules = await approvalRules.listRules();
+    res.json({ rules });
+  } catch (err) { next(err); }
+};
+
+exports.createApprovalRule = async (req, res, next) => {
+  try {
+    const { name, condition, appliesTo } = req.body || {};
+    const rule = await approvalRules.createRule({ name, condition, appliesTo, createdBy: req.user.id });
+    securityLogger.logSecurityEvent('APPROVAL_RULE_CREATED', { ruleId: rule.id, name: rule.name, userId: req.user.id });
+    res.status(201).json({ rule });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message, code: 'INVALID_RULE' });
+    next(err);
+  }
+};
+
+exports.updateApprovalRule = async (req, res, next) => {
+  try {
+    const rule = await approvalRules.updateRule(req.params.ruleId, req.body || {});
+    securityLogger.logSecurityEvent('APPROVAL_RULE_UPDATED', { ruleId: rule.id, userId: req.user.id });
+    res.json({ rule });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message, code: err.status === 404 ? 'RULE_NOT_FOUND' : 'INVALID_RULE' });
+    next(err);
+  }
+};
+
+exports.deleteApprovalRule = async (req, res, next) => {
+  try {
+    await approvalRules.deleteRule(req.params.ruleId);
+    securityLogger.logSecurityEvent('APPROVAL_RULE_DELETED', { ruleId: req.params.ruleId, userId: req.user.id });
+    res.json({ success: true });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message, code: 'RULE_NOT_FOUND' });
+    next(err);
+  }
+};

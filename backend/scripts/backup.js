@@ -47,7 +47,7 @@
  * degraded version of that, it's a different (and unwanted) thing.
  */
 
-const { execFileSync } = require('child_process');
+const tar    = require('tar');
 const crypto = require('crypto');
 const fs     = require('fs');
 const path   = require('path');
@@ -109,7 +109,7 @@ async function main() {
   const encPath = `${tarPath}.enc`;
 
   console.log(`[backup] Archiving: ${paths.join(', ')}`);
-  execFileSync('tar', ['-czf', tarPath, '-C', BACKEND_ROOT, ...paths]);
+  await tar.create({ gzip: true, file: tarPath, cwd: BACKEND_ROOT }, paths);
 
   const sizeMb = (fs.statSync(tarPath).size / (1024 * 1024)).toFixed(2);
   console.log(`[backup] Archive created (${sizeMb} MB). Encrypting...`);

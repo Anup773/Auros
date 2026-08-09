@@ -1,3 +1,4 @@
+
 'use strict';
 /**
  * backend/controllers/admin.controller.js
@@ -61,7 +62,7 @@ exports.updateUserRole = async (req, res) => {
 
   const previousRole = user.role;
   user.role = role;
-  saveUsers();
+  await saveUsers();
 
   // A role change is a permission change — it should take effect
   // immediately, not whenever the user's current token happens to expire.
@@ -86,7 +87,7 @@ exports.disableUser = async (req, res) => {
   if (!user) return res.status(404).json({ error: 'User not found', code: 'USER_NOT_FOUND' });
 
   user.disabled = true;
-  saveUsers();
+  await saveUsers();
   const revokedCount = await sessionStore.revokeAllSessionsForUser(user.id, 'account_disabled');
 
   securityLogger.logSecurityEvent('ACCOUNT_DISABLED', {
@@ -97,28 +98,46 @@ exports.disableUser = async (req, res) => {
 };
 
 // ── POST /api/admin/users/:id/enable ──────────────────────────────────────────
-exports.enableUser = (req, res) => {
+exports.enableUser = async (req, res) => {
   const { id } = req.params;
   const user = _userByIdStore.get(id);
   if (!user) return res.status(404).json({ error: 'User not found', code: 'USER_NOT_FOUND' });
 
   user.disabled = false;
-  saveUsers();
+  await saveUsers();
 
   securityLogger.logSecurityEvent('ACCOUNT_ENABLED', { targetUserId: user.id, enabledBy: req.user.id, ip: req.ip, severity: 'medium' });
 
   res.json({ success: true, user: safeUserForAdmin(user) });
 };
 
-// ── GET /api/admin/security-log?date=YYYY-MM-DD ───────────────────────────────
+// ── GET /api/admin/security-log?date=YYYY-MM-DD&offset=0&limit=100&verify=true ─
 // A small operational nicety on top of the new SOC2-style logging: lets an
 // admin pull a day's security events (and confirm the log hasn't been
 // tampered with) without shelling into the server.
+//
+// PHASE 2 (post-review) FIX: previously read + parsed the ENTIRE day's log
+// TWICE per request (once for events, once for the integrity check) with no
+// limit — fine at the event volumes this was tested at, but would get
+// heavier every day as a real deployment's log grows. Now paginated
+// (default 100 most-recent events) and integrity verification is opt-in
+// (?verify=true) rather than run on every single call.
 exports.getSecurityLog = async (req, res) => {
   const dateStr = typeof req.query.date === 'string' ? req.query.date : undefined;
-  const [events, integrity] = await Promise.all([
-    securityLogger.getEvents(dateStr),
-    securityLogger.verifyChainIntegrity(dateStr),
-  ]);
-  res.json({ events, integrity });
+  const limit   = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 1000);
+  const offset  = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  const verify  = req.query.verify === 'true';
+
+  const allEvents = await securityLogger.getEvents(dateStr);
+  // Most-recent-first, matching how an admin actually wants to read a log.
+  const ordered = allEvents.slice().reverse();
+  const page = ordered.slice(offset, offset + limit);
+
+  const response = {
+    events: page,
+    pagination: { offset, limit, returned: page.length, total: allEvents.length },
+  };
+  if (verify) response.integrity = await securityLogger.verifyChainIntegrity(dateStr);
+
+  res.json(response);
 };

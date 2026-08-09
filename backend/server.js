@@ -103,6 +103,17 @@ async function shutdown(signal) {
       }
     }
 
+    // The shared Redis connection used by sessions/refresh tokens, MFA
+    // challenges, and the rate limiter (config/redis.js) — close it
+    // alongside the BullMQ connections above.
+    try {
+      const { closeRedis } = require('./config/redis');
+      await closeRedis();
+      console.log('[server] Shared Redis connection closed.');
+    } catch (err) {
+      console.error('[server] Error closing shared Redis connection:', err.message);
+    }
+
     // FIX: clear the forced-exit timer — shutdown completed cleanly
     clearTimeout(timeoutId);
     console.log('[server] Shutdown complete.');
@@ -145,4 +156,3 @@ process.on('uncaughtException', (err) => {
 });
 
 module.exports = server;
-

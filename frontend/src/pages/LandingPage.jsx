@@ -5,13 +5,13 @@ import './LandingPage.css';
 const FEATURES = [
   {
     icon: '🔍',
-    title: 'AI detects every issue',
-    desc: 'Missing values, duplicates, format mismatches, unmatched invoices — found instantly and explained in plain English.',
+    title: 'Detects every issue automatically',
+    desc: 'Missing values, duplicates, format mismatches, unmatched invoices — found instantly by our backend automation system and explained in plain English. Genuinely complex cases are escalated to full AI reasoning.',
   },
   {
     icon: '💬',
-    title: 'AI asks before acting',
-    desc: 'Instead of silently changing your data, AI asks you one clear question per issue. You decide, it executes.',
+    title: 'Asks before acting',
+    desc: 'Instead of silently changing your data, the system asks you one clear question per issue. You decide, it executes.',
   },
   {
     icon: '✅',
@@ -22,11 +22,6 @@ const FEATURES = [
     icon: '📋',
     title: 'Invoice reconciliation',
     desc: 'Match invoices to POs, detect duplicate bills, flag amount mismatches — all resolved through your approvals.',
-  },
-  {
-    icon: '📱',
-    title: 'Approve via WhatsApp',
-    desc: 'Away from your desk? AI sends approval questions to your WhatsApp. Reply to decide, no login needed.',
   },
   {
     icon: '📦',
@@ -43,8 +38,8 @@ const STEPS = [
   },
   {
     num: '02',
-    title: 'AI interviews you',
-    desc: 'For every issue found, AI asks one clear question. You answer by text, quick-pick, or WhatsApp reply.',
+    title: 'The system interviews you',
+    desc: 'For every issue found, it asks one clear question. You answer by text or quick-pick.',
   },
   {
     num: '03',
@@ -65,14 +60,9 @@ const USE_CASES = [
     items: ['Invoice vs PO reconciliation', 'Duplicate invoice detection', 'Vendor name normalization', 'Amount mismatch flagging'],
   },
   {
-    icon: '📊',
-    title: 'Operations & Analytics',
-    items: ['CRM data cleanup', 'Sales report normalization', 'Missing value handling', 'Format standardization'],
-  },
-  {
     icon: '🏢',
     title: 'Enterprise Teams',
-    items: ['Multi-person approval workflows', 'WhatsApp-based decisions', 'Full audit trails', 'Pipeline export for reuse'],
+    items: ['Multi-person approval workflows', 'In-app quick-pick decisions', 'Full audit trails', 'Pipeline export for reuse'],
   },
 ];
 
@@ -123,14 +113,14 @@ export default function LandingPage() {
       {/* ── Hero ── */}
       <section className="lp-hero">
         <div className="lp-container">
-          <div className="lp-hero__badge">AI-Powered Operational Decisions</div>
+          <div className="lp-hero__badge">Automated Operational Decisions</div>
           <h1 className="lp-hero__title">
             Your data doesn't get cleaned.<br />
             <span className="lp-hero__accent">It gets decided.</span>
           </h1>
           <p className="lp-hero__sub">
-            Auros is an AI workspace for finance and operations teams. Upload invoices or messy data,
-            let AI detect every issue, answer its questions — and get clean, reconciled output
+            Auros is a backend automation workspace for finance and operations teams. Upload invoices or messy data,
+            let our system detect every issue, answer its questions — and get clean, reconciled output
             with a full audit trail. Nothing changes without your explicit approval.
           </p>
           <div className="lp-hero__actions">
@@ -155,7 +145,7 @@ export default function LandingPage() {
               <span className="lp-mockup__title">invoices_q3.csv — Auros</span>
             </div>
             <div className="lp-mockup__phases">
-              {['Upload','Analyze','AI Review','Approve','Execute'].map((p, i) => (
+              {['Upload','Analyze','Review','Approve','Execute'].map((p, i) => (
                 <React.Fragment key={p}>
                   <span className={`lp-phase ${i === 2 ? 'lp-phase--active' : ''}`}>{p}</span>
                   {i < 4 && <span className="lp-phase__arrow">›</span>}
@@ -163,7 +153,7 @@ export default function LandingPage() {
               ))}
             </div>
             <div className="lp-mockup__ai">
-              <span className="lp-mockup__ai-badge">AI</span>
+              <span className="lp-mockup__ai-badge">AUTO</span>
               <span className="lp-mockup__ai-text">
                 Invoice <strong>INV-2847</strong> from <strong>Apex Supplies Ltd</strong> is{' '}
                 <strong className="lp-text-warn">₹12,400 higher</strong> than the matched PO amount.
@@ -189,17 +179,17 @@ export default function LandingPage() {
                 <li>Finance team manually cross-checks invoices in Excel</li>
                 <li>Duplicate payments go unnoticed for weeks</li>
                 <li>Data cleaning runs silently — you don't know what changed</li>
-                <li>Approvals happen over WhatsApp messages, no record</li>
+                <li>Approvals happen over email or chat, no record</li>
                 <li>Auditors ask "who approved this?" — no answer</li>
               </ul>
             </div>
             <div className="lp-problem__col lp-problem__col--good">
               <div className="lp-problem__label">✓ With Auros</div>
               <ul>
-                <li>AI matches invoices to POs in seconds</li>
+                <li>Matches invoices to POs in seconds</li>
                 <li>Every duplicate flagged before payment</li>
                 <li>Every data change requires your explicit approval</li>
-                <li>WhatsApp approvals captured and logged automatically</li>
+                <li>Every approval captured and logged automatically</li>
                 <li>Full audit trail — who decided what and when</li>
               </ul>
             </div>
@@ -271,45 +261,48 @@ export default function LandingPage() {
           <div className="lp-pricing__grid">
 
             <div className="lp-pricing-card">
-              <div className="lp-pricing-card__name">Free</div>
-              <div className="lp-pricing-card__price">$0<span>/mo</span></div>
+              <div className="lp-pricing-card__name">Starter</div>
+              <div className="lp-pricing-card__price">$19<span>/mo</span></div>
               <ul className="lp-pricing-card__list">
-                <li>3 cleanups or reconciliations per month</li>
-                <li>Up to 5,000 rows per file</li>
-                <li>Dashboard approvals</li>
-                <li>CSV download</li>
+                <li>Up to 500 invoices/month</li>
+                <li>CSV, XLSX, XML uploads</li>
+                <li>Invoice reconciliation</li>
+                <li>Voice commands</li>
+                <li>Email support</li>
               </ul>
               <button className="lp-btn-outline lp-pricing-card__btn" onClick={() => navigate('/signup')}>
-                Get started free
+                Start Starter free for 3 days
               </button>
+              <p className="lp-pricing-card__note">Card required, not charged until the trial ends</p>
             </div>
 
             <div className="lp-pricing-card lp-pricing-card--featured">
               <div className="lp-pricing-card__badge">Most popular</div>
-              <div className="lp-pricing-card__name">Pro</div>
-              <div className="lp-pricing-card__price">$19<span>/mo</span></div>
+              <div className="lp-pricing-card__name">Growth</div>
+              <div className="lp-pricing-card__price">$49<span>/mo</span></div>
               <ul className="lp-pricing-card__list">
-                <li>Unlimited cleanups & reconciliations</li>
-                <li>Up to 500,000 rows</li>
-                <li>WhatsApp approval notifications</li>
-                <li>Pipeline export (JSON)</li>
-                <li>Full audit trail</li>
+                <li>Up to 5,000 invoices/month</li>
+                <li>All Starter features</li>
+                <li>PDF & image OCR</li>
+                <li>Audit trails</li>
                 <li>Priority support</li>
               </ul>
               <button className="lp-btn-primary lp-pricing-card__btn" onClick={() => navigate('/signup')}>
-                Start Pro free for 14 days
+                Start Growth free for 3 days
               </button>
+              <p className="lp-pricing-card__note">Card required, not charged until the trial ends</p>
             </div>
 
             <div className="lp-pricing-card">
-              <div className="lp-pricing-card__name">Team</div>
-              <div className="lp-pricing-card__price">$49<span>/mo</span></div>
+              <div className="lp-pricing-card__name">Enterprise</div>
+              <div className="lp-pricing-card__price">Custom</div>
               <ul className="lp-pricing-card__list">
-                <li>Everything in Pro</li>
-                <li>Up to 10 team members</li>
-                <li>Shared pipeline library</li>
-                <li>Audit log export</li>
-                <li>SSO</li>
+                <li>Unlimited invoices</li>
+                <li>All Growth features</li>
+                <li>Custom integrations</li>
+                <li>Dedicated support</li>
+                <li>SLA guarantee</li>
+                <li>On-premise option</li>
               </ul>
               <button className="lp-btn-outline lp-pricing-card__btn" onClick={() => navigate('/signup')}>
                 Contact us
@@ -338,7 +331,7 @@ export default function LandingPage() {
         <div className="lp-container lp-footer__inner">
           <div className="lp-footer__brand">
             <span className="lp-footer__logo">auros<span className="lp-nav__dot">.</span></span>
-            <p className="lp-footer__tagline">AI decisions. Human approval.</p>
+            <p className="lp-footer__tagline">Automated decisions. Human approval.</p>
           </div>
           <div className="lp-footer__cols">
             <div className="lp-footer__col">

@@ -1,3 +1,4 @@
+
 'use strict';
 /**
  * backend/services/auth/apiKey.service.js
@@ -25,6 +26,7 @@
  */
 
 const fs     = require('fs');
+const fsp    = fs.promises;
 const path   = require('path');
 const crypto = require('crypto');
 
@@ -33,6 +35,7 @@ const DATA_FILE = path.join(DATA_DIR, 'apiKeys.json');
 
 const KEY_PREFIX = process.env.API_KEY_PREFIX || 'auros_live_';
 const READ_CACHE_TTL_MS = 5000; // avoids a Redis/disk round trip on every single API-key-authenticated request
+const LAST_USED_FLUSH_MS = parseInt(process.env.API_KEY_LAST_USED_FLUSH_MS || '60000', 10);
 
 // ── In-memory store: id -> record ─────────────────────────────────────────────
 const keyStore = new Map();
@@ -55,14 +58,21 @@ function _load() {
   }
 }
 
+let _saveQueue = Promise.resolve();
+
 function _save() {
+  _saveQueue = _saveQueue.then(_doSave, _doSave);
+  return _saveQueue;
+}
+
+async function _doSave() {
   try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(DATA_DIR)) await fsp.mkdir(DATA_DIR, { recursive: true });
     const obj = {};
     for (const [id, record] of keyStore.entries()) obj[id] = record;
     const tmpFile = DATA_FILE + '.tmp';
-    fs.writeFileSync(tmpFile, JSON.stringify(obj, null, 2), 'utf8');
-    fs.renameSync(tmpFile, DATA_FILE); // atomic on POSIX, same pattern as auth.controller.js's saveUsers()
+    await fsp.writeFile(tmpFile, JSON.stringify(obj, null, 2), 'utf8');
+    await fsp.rename(tmpFile, DATA_FILE);
   } catch (err) {
     console.error('[apiKey] Failed to save API keys:', err.message);
   }
@@ -75,7 +85,7 @@ function _hash(raw) {
 }
 
 function _generateId() {
-  return `key_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  return `key_${crypto.randomUUID()}`;
 }
 
 /**
@@ -91,7 +101,7 @@ function _generateId() {
  *          `key` (the full plaintext value) is ONLY ever returned here —
  *          it cannot be retrieved again after this call returns.
  */
-function createApiKey(userId, name, opts = {}) {
+async function createApiKey(userId, name, opts = {}) {
   const secret = crypto.randomBytes(24).toString('base64url');
   const fullKey = `${KEY_PREFIX}${secret}`;
   const keyHash = _hash(fullKey);
@@ -114,7 +124,7 @@ function createApiKey(userId, name, opts = {}) {
 
   keyStore.set(id, record);
   _hashIndex.set(keyHash, id);
-  _save();
+  await _save();
 
   return { id, key: fullKey, keyPrefix: record.keyPrefix, name: record.name, role: record.role, createdAt, expiresAt };
 }
@@ -128,17 +138,27 @@ function listApiKeysForUser(userId) {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
-function revokeApiKey(userId, keyId) {
+async function revokeApiKey(userId, keyId) {
   const record = keyStore.get(keyId);
   if (!record || record.userId !== userId) return false;
   record.revoked = true;
   record.revokedAt = new Date().toISOString();
-  _save();
+  await _save();
   return true;
 }
 
 // ── Verification (hot path — called on every API-key-authenticated request) ──
 const _readCache = new Map(); // keyHash -> { record, cachedAt }
+
+let _lastUsedDirty = false;
+
+const _flushInterval = setInterval(() => {
+  if (_lastUsedDirty) {
+    _lastUsedDirty = false;
+    _save();
+  }
+}, LAST_USED_FLUSH_MS);
+if (_flushInterval.unref) _flushInterval.unref();
 
 /**
  * @returns {{ valid:true, userId, role, keyId } | { valid:false, reason }}
@@ -161,10 +181,10 @@ async function verifyApiKey(rawKey) {
   if (record.revoked) return { valid: false, reason: 'REVOKED' };
   if (record.expiresAt && new Date(record.expiresAt).getTime() < Date.now()) return { valid: false, reason: 'EXPIRED' };
 
-  // Best-effort, non-blocking last-used timestamp update — never delays the
-  // request and never fails the auth check if the write has trouble.
+  // In-memory update is free; the disk write is debounced (see above) rather
+  // than happening on every single request.
   record.lastUsedAt = new Date().toISOString();
-  setImmediate(() => { try { _save(); } catch { /* best-effort */ } });
+  _lastUsedDirty = true;
 
   return { valid: true, userId: record.userId, role: record.role, keyId: record.id };
 }

@@ -67,7 +67,7 @@ exports.verifySetup = async (req, res, next) => {
     user.mfaBackupCodeHashes = backupCodes.map(c => mfaService.hashBackupCode(c));
     user.mfaEnabledAt = new Date().toISOString();
     user.mfaLastTimeStep = result.timeStep;
-    saveUsers();
+    await saveUsers();
 
     securityLogger.logSecurityEvent('MFA_ENABLED', { userId: user.id, ip: req.ip, severity: 'high' });
 
@@ -107,7 +107,7 @@ exports.disable = async (req, res, next) => {
     user.mfaSecretEncrypted = null;
     user.mfaBackupCodeHashes = null;
     user.mfaLastTimeStep = null;
-    saveUsers();
+    await saveUsers();
 
     // Disabling a security control is exactly the moment to make sure no
     // OTHER already-open session (e.g. from a device the real owner no
@@ -146,13 +146,13 @@ exports.verifyChallenge = async (req, res, next) => {
     if (code) {
       const result = await mfaService.verifyTotp(user.mfaSecretEncrypted, code, user.mfaLastTimeStep);
       verified = result.valid;
-      if (verified) { user.mfaLastTimeStep = result.timeStep; saveUsers(); }
+      if (verified) { user.mfaLastTimeStep = result.timeStep; await saveUsers(); }
     } else if (backupCode) {
       const idx = mfaService.findBackupCodeIndex(backupCode, user.mfaBackupCodeHashes || []);
       if (idx !== -1) {
         verified = true;
         user.mfaBackupCodeHashes.splice(idx, 1); // single-use
-        saveUsers();
+        await saveUsers();
         securityLogger.logSecurityEvent('MFA_BACKUP_CODE_USED', {
           userId: user.id, ip: req.ip, remainingCodes: user.mfaBackupCodeHashes.length, severity: 'medium',
         });

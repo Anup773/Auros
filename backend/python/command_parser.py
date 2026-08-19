@@ -328,6 +328,143 @@ _RE_COUNT_N = re.compile(
     re.IGNORECASE
 )
 
+# ── RULE-MANAGEMENT commands (criteria-based auto-approval, chat-only UI) ────
+# Distinct intent space from the approve/reject/hold action commands above:
+# these create/list/toggle/delete a PERSISTENT rule that auto-approves future
+# reconciliation items (services/procurement/approvalRules.service.js) rather
+# than acting once on THIS job's ambiguities. Requires an explicit standing-
+# policy signal word so an ordinary one-time command like "approve all
+# invoices under $500" is completely unaffected and still runs once, as
+# before — only phrasing that clearly signals "make this permanent" routes
+# here. Checked BEFORE _detect_action (Section 6) for exactly that reason.
+_RE_RULE_SIGNAL = re.compile(
+    r'\brules?\b|\bautomatically\b|\bauto[\s-]?approves?\b|\bgoing forward\b|'
+    r'\bfrom now on\b|\bevery time\b|\balways\b|\bstanding rule\b|\bby default\b',
+    re.IGNORECASE
+)
+_RE_RULE_LIST = re.compile(
+    r'\b(list|show|view|what|which)\b[^.?!]{0,20}\brules?\b', re.IGNORECASE
+)
+_RE_RULE_DELETE = re.compile(r'\b(delete|remove)\b[^.?!]{0,40}\brule\b', re.IGNORECASE)
+_RE_RULE_OFF    = re.compile(r'\b(disable|turn\s+off|pause|deactivate)\b[^.?!]{0,40}\brule\b', re.IGNORECASE)
+_RE_RULE_ON     = re.compile(r'\b(enable|turn\s+on|resume|reactivate)\b[^.?!]{0,40}\brule\b', re.IGNORECASE)
+_RE_PERCENT     = re.compile(r'([\d.]+)\s*(?:%|percent|pct)\b', re.IGNORECASE)
+# Words stripped out when isolating which rule a delete/enable/disable
+# command refers to — whatever text remains is passed to Node as a raw
+# reference string; Node matches it against the user's actual saved rule
+# names (the parser has no access to that list — it only sees ambiguities).
+_RULE_REF_STRIP = re.compile(
+    r'\b(delete|remove|disable|enable|turn\s+off|turn\s+on|pause|resume|'
+    r'deactivate|reactivate|the|a|an|my|our|rule|rules|called|named|for|'
+    r'please|could you|can you)\b',
+    re.IGNORECASE
+)
+
+
+def _extract_rule_reference(t: str) -> str | None:
+    stripped = _RULE_REF_STRIP.sub(' ', t)
+    stripped = re.sub(r'\s+', ' ', stripped).strip(' :\'"')
+    return stripped if len(stripped) >= 2 else None
+
+
+def _detect_rule_command(t: str, text: str) -> dict | None:
+    """
+    Returns a complete parser result if `t` is a rule-management command
+    (create/list/delete/enable/disable), or None if it isn't one at all —
+    in which case op_parse_command proceeds down its normal action-parsing
+    path untouched.
+    """
+    ts_start = time.time()
+
+    if not _RE_RULE_SIGNAL.search(t):
+        return None
+
+    # LIST — cheapest, no condition/reference parsing needed.
+    if _RE_RULE_LIST.search(t):
+        return {
+            "actions": [{"action": "list_rules"}],
+            "confidence": 0.95, "needsAI": False, "needsConfirmation": False,
+            "lowConfidence": False,
+            "interpretation": "List your approval rules",
+            "rawText": text, "matchType": "rule_command", "cancelled": False,
+            "conflicts": [], "emptyResult": False,
+            "audit": _build_audit("rule_list", "rules", "direct_parse", ts_start),
+        }
+
+    # DELETE / DISABLE / ENABLE — all need a reference to resolve against
+    # the user's real rule list, which only Node has. If nothing reasonable
+    # extracts, this is too ambiguous to guess — route to AI rather than
+    # risk silently touching the wrong (or no) rule.
+    for pattern, action, ai_reason in (
+        (_RE_RULE_DELETE, "delete_rule", "Could not tell which rule to delete"),
+        (_RE_RULE_OFF,    "toggle_rule", "Could not tell which rule to disable"),
+        (_RE_RULE_ON,     "toggle_rule", "Could not tell which rule to enable"),
+    ):
+        if pattern.search(t):
+            ref = _extract_rule_reference(t)
+            if not ref:
+                return _needs_ai(text, ai_reason, "rule_reference_unclear")
+            action_obj = {"action": action, "ruleReference": ref}
+            if action == "toggle_rule":
+                action_obj["enable"] = bool(_RE_RULE_ON.search(t))
+            verb = {"delete_rule": "Delete", "toggle_rule": "Update"}[action]
+            return {
+                "actions": [action_obj],
+                "confidence": 0.85, "needsAI": False, "needsConfirmation": False,
+                "lowConfidence": False,
+                "interpretation": f'{verb} rule matching "{ref}"',
+                "rawText": text, "matchType": "rule_command", "cancelled": False,
+                "conflicts": [], "emptyResult": False,
+                "audit": _build_audit(f"rule_{action}", ref, "direct_parse", ts_start),
+            }
+
+    # CREATE — only reached if this wasn't list/delete/enable/disable, but
+    # still tripped the rule-signal check above (e.g. "always approve...",
+    # "auto-approve... automatically", "create a rule to...").
+    has_pct    = bool(_RE_PERCENT.search(t))
+    has_amount = bool(_RE_UNDER.search(t)) and not has_pct
+    vendor_kws = _extract_vendor_keywords(t) if not (has_pct or has_amount) else []
+    signals_found = sum([has_pct, has_amount, bool(vendor_kws)])
+
+    if signals_found == 0:
+        # Clearly rule-intent ("create a rule to auto-approve legitimate
+        # invoices") but no extractable numeric/vendor condition — this
+        # needs real language understanding, not a guess.
+        return _needs_ai(text, "Rule intent detected but no condition could be extracted", "rule_condition_unclear")
+    if signals_found > 1:
+        # Compound criteria ("auto-approve invoices from Acme under $500") —
+        # a rule's condition is a single gate (see approvalRules.service.js),
+        # not an AND of several. Guessing which one the user actually meant
+        # is exactly the kind of judgement call that belongs to AI, not a
+        # silent pick here.
+        return _needs_ai(text, "Multiple possible rule conditions found — ambiguous which one applies", "rule_condition_ambiguous")
+
+    if has_pct:
+        pct = float(_RE_PERCENT.search(t).group(1))
+        condition = {"type": "variance_under_pct", "threshold": pct}
+        desc = f"variance under {pct}%"
+    elif has_amount:
+        amt = float(_RE_UNDER.search(t).group(1).replace(',', ''))
+        condition = {"type": "amount_under", "threshold": amt}
+        desc = f"amount under ${amt:,.2f}".rstrip('0').rstrip('.')
+    else:
+        condition = {"type": "vendor_in", "vendors": vendor_kws}
+        desc = f"vendor is {' / '.join(vendor_kws)}"
+
+    return {
+        "actions": [{
+            "action"  : "create_rule",
+            "condition": condition,
+            "ruleName" : f"Auto-approve when {desc}",
+        }],
+        "confidence": 0.9, "needsAI": False, "needsConfirmation": False,
+        "lowConfidence": False,
+        "interpretation": f"Create a rule: auto-approve when {desc}",
+        "rawText": text, "matchType": "rule_command", "cancelled": False,
+        "conflicts": [], "emptyResult": False,
+        "audit": _build_audit("rule_create", desc, "direct_parse", ts_start),
+    }
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 2 — SELECTION EXPRESSION (FIX-07 / FIX-14 / FIX-25)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -535,9 +672,27 @@ def op_parse_command(config: dict) -> dict:
     if compound_result is not None:
         return _apply_bulk_confirmation(compound_result, text, ambiguities, total_items)
 
-    # ── STEP 2: FIX-02 NEGATION CHECK ────────────────────────────────────────
+    # ── STEP 1.6: FIX-02 NEGATION CHECK (moved up from old STEP 2) ────────────
+    # Checked before rule-command detection too, for the same reason FIX-02
+    # exists at all: "don't create a rule to auto-approve under $500" must not
+    # silently create one just because _detect_rule_command below has no
+    # negation awareness of its own.
     if _has_leading_negation(t):
         return _needs_ai(text, "Negated command detected", "negation_detected")
+
+    # ── STEP 1.7: RULE-MANAGEMENT COMMAND ─────────────────────────────────────
+    # list/create/delete/enable/disable a standing approval rule. Must run
+    # BEFORE item-action detection below: "approve invoices under $500 from
+    # now on" contains an action keyword ("approve") and an amount filter
+    # ("under $500") that _detect_action/_parse_target would happily turn into
+    # a one-time bulk approval of the CURRENT items — exactly the wrong
+    # interpretation of a standing-policy command. _RE_RULE_SIGNAL only fires
+    # on explicit rule/standing-policy language ("rule", "automatically",
+    # "from now on", "going forward", "always", etc.), so ordinary bulk
+    # actions ("approve items 1 to 50") are completely unaffected.
+    rule_result = _detect_rule_command(t, text)
+    if rule_result is not None:
+        return rule_result
 
     # ── STEP 3: Detect action ─────────────────────────────────────────────────
     detected_action, matched_kw = _detect_action(t)
@@ -1952,4 +2107,3 @@ if __name__ == "__main__":
             "trace": tb,
         }))
         sys.stdout.flush()
-

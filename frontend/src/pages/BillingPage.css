@@ -120,6 +120,16 @@
   gap: 12px;
 }
 
+.billing-no-sub {
+  background: #f4f5f7;
+  border: 1px solid #e2e4e8;
+  border-radius: 12px;
+  padding: 14px 20px;
+  margin-bottom: 32px;
+  font-size: 14px;
+  color: #5b616e;
+}
+
 .billing-current-sub__left {
   display: flex;
   align-items: center;
@@ -254,6 +264,15 @@
   background: #f0fdf4;
 }
 
+/* NEW: the plan someone picked on the landing page, carried through
+   signup — highlighted here so their choice is visibly acknowledged
+   instead of silently landing on a generic, unmarked pricing grid. */
+.billing-card--preselected {
+  border-color: #1a7a4a;
+  border-width: 2px;
+  box-shadow: 0 0 0 3px rgba(26,122,74,0.12);
+}
+
 .billing-card__popular-badge {
   position: absolute;
   top: -12px;
@@ -267,6 +286,11 @@
   padding: 4px 14px;
   border-radius: 12px;
   white-space: nowrap;
+}
+
+.billing-card__popular-badge--selected {
+  background: #1a7a4a;
+  color: #fff;
 }
 
 .billing-card__header {

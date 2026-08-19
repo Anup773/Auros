@@ -17,3 +17,25 @@ dist/
 # PHASE 2 — generated/sensitive, should never be committed
 data/apiKeys.json
 backups/
+data/users.json
+data/approvalRules.jsonnode_modules/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.local
+uploads/*
+!uploads/.gitkeep
+temp/
+logs/
+*.log
+.pytest_cache/
+.mypy_cache/
+coverage/
+dist/
+
+# PHASE 2 — generated/sensitive, should never be committed
+data/apiKeys.json
+backups/
+data/users.json
+data/approvalRules.json

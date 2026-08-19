@@ -39,6 +39,7 @@ export default function DashboardPage() {
         <div className="dashboard__brand">auros<span className="dashboard__dot">.</span></div>
         <div className="dashboard__topbar-right">
           <span className="dashboard__user">{user?.name || 'My Workspace'}</span>
+          <button className="btn-ghost dashboard__logout" onClick={() => navigate('/billing')}>Billing</button>
           <button className="btn-ghost dashboard__logout" onClick={handleLogout}>Log out</button>
         </div>
       </header>

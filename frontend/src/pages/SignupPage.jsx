@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { authAPI } from '../services/api';
 import './AuthPage.css';
@@ -12,9 +12,31 @@ import './AuthPage.css';
 // ─────────────────────────────────────────────────────────────────────────────
 const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID || '';
 
+const PLAN_LABELS = { starter: 'Starter', growth: 'Growth', enterprise: 'Enterprise' };
+
 export default function SignupPage() {
   const navigate  = useNavigate();
   const { login } = useAuth();
+  const [searchParams] = useSearchParams();
+
+  // BUGFIX: every pricing-card button on the landing page linked here with
+  // no indication of which plan was clicked — "Start Growth free for 3
+  // days" and the generic "Start free trial" button led to the exact same
+  // blank form, so the plan choice was silently dropped every time. Now
+  // read from ?plan=, shown below, and used to route somewhere useful after
+  // signup instead of always going straight to /dashboard.
+  const planParam = searchParams.get('plan');
+  const plan = planParam && PLAN_LABELS[planParam] ? planParam : null;
+
+  // Where to land after a successful signup. A plan-specific signup goes to
+  // Billing with that plan highlighted so the person can actually start
+  // their trial — nothing here starts checkout automatically or collects a
+  // card by itself; it just makes sure their choice wasn't thrown away.
+  // A generic signup (no plan in the URL — nav/hero buttons, direct links
+  // sent to test users) still goes straight to the dashboard with full
+  // access, unchanged from before — this is what keeps friends/companies
+  // testing card-free during the test phase.
+  const postSignupPath = plan ? `/billing?plan=${plan}` : '/dashboard';
 
   const [form,          setForm]          = useState({ name: '', email: '', password: '' });
   const [error,         setError]         = useState('');
@@ -46,7 +68,7 @@ export default function SignupPage() {
     try {
       const data = await authAPI.signup(form.name, form.email, form.password);
       login(data.user, data.token);
-      navigate('/dashboard', { replace: true });
+      navigate(postSignupPath, { replace: true });
     } catch (err) {
       setError(err.message || 'Signup failed. Please try again.');
     } finally {
@@ -81,7 +103,7 @@ export default function SignupPage() {
           try {
             const data = await authAPI.googleLogin(tokenResponse.access_token);
             login(data.user, data.token);
-            navigate('/dashboard', { replace: true });
+            navigate(postSignupPath, { replace: true });
           } catch (err) {
             setError(err.message || 'Google sign-up failed. Please try again.');
           } finally {
@@ -106,7 +128,11 @@ export default function SignupPage() {
         </Link>
 
         <h1 className="auth-card__title">Create your account</h1>
-        <p className="auth-card__sub">Free forever. No credit card required.</p>
+        <p className="auth-card__sub">
+          {plan
+            ? <>Signing up for the <strong>{PLAN_LABELS[plan]}</strong> plan — 3-day free trial.</>
+            : 'Free 3-day trial. No credit card required to sign up.'}
+        </p>
 
         {error && <div className="auth-card__error">{error}</div>}
 

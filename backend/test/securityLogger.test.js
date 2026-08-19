@@ -20,7 +20,20 @@ describe('securityLogger.service', () => {
 
   after(async () => {
     await securityLogger.flush();
-    if (originalContent !== null) fs.writeFileSync(LOG_FILE, originalContent, 'utf8');
+    // BUGFIX: previously only handled the "restore prior content" branch.
+    // When the log file didn't exist before this suite ran (the common
+    // case — first run of the day), originalContent is null and nothing
+    // happened here, so this suite's own entries — including the line the
+    // tamper test deliberately corrupts — were left on disk. A second
+    // same-day run would then inherit an already-broken chain and fail
+    // both the "hash chain is valid" and "detects a tampered line"
+    // assertions, even though nothing is actually wrong. Now the file is
+    // removed in that case instead of left behind.
+    if (originalContent !== null) {
+      fs.writeFileSync(LOG_FILE, originalContent, 'utf8');
+    } else if (fs.existsSync(LOG_FILE)) {
+      fs.unlinkSync(LOG_FILE);
+    }
   });
 
   test('logSecurityEvent redacts sensitive fields', async () => {
@@ -71,3 +84,4 @@ describe('securityLogger.service', () => {
     assert.equal(integrity.totalLines, 0);
   });
 });
+

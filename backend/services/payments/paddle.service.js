@@ -253,7 +253,35 @@ async function createCheckout(planId, userId, userEmail, returnUrl) {
     successUrl: `${returnUrl}?checkout=success&plan=${planId}`,
   };
 
-  const response = await _paddleRequest('POST', '/v1/transactions', checkoutData);
+  let response;
+  try {
+    response = await _paddleRequest('POST', '/v1/transactions', checkoutData);
+  } catch (err) {
+    // BUGFIX: the placeholder guard above only catches the literal word
+    // "placeholder" in the configured price ID — it does NOT catch a
+    // real-looking but WRONG price ID (typo'd, copied from the wrong plan,
+    // or copied from the wrong Paddle environment — Sandbox and Live are
+    // two separate systems in Paddle with different price IDs; using a
+    // Sandbox ID while PADDLE_ENVIRONMENT=production, or vice versa, fails
+    // the exact same way). That case reaches Paddle's real API and comes
+    // back as a raw, confusing error ("URL called is invalid" and similar)
+    // that gave no hint about what was actually wrong. Any failure at this
+    // specific call — creating a transaction against a configured price ID
+    // — is overwhelmingly a price-ID/environment mismatch, so wrap it with
+    // a concrete, checkable hint rather than surfacing Paddle's raw text
+    // alone.
+    throw Object.assign(
+      new Error(
+        `Paddle rejected this checkout (${err.message}). This almost always means ` +
+        `PADDLE_PRICE_${planId.toUpperCase()} in your .env doesn't match a real price ID in your ` +
+        `Paddle dashboard for the "${PADDLE_ENV}" environment. Check: (1) the ID is copied exactly ` +
+        `from Paddle → Catalog → Prices, (2) PADDLE_ENVIRONMENT in .env matches whether that price ` +
+        `is under Sandbox or Live Paddle, (3) there's no extra space/quote around it in .env, ` +
+        `(4) you restarted the server after editing .env.`
+      ),
+      { status: err.status || 502, code: 'PADDLE_CHECKOUT_FAILED', paddleError: err.paddleError }
+    );
+  }
 
   return {
     checkoutUrl  : response.data?.checkout?.url || `https://checkout.paddle.com/checkout/custom?_product=${plan.paddlePriceId}`,

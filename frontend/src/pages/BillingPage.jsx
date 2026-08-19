@@ -1,20 +1,20 @@
+
 /**
  * frontend/src/pages/BillingPage.jsx
  *
  * Pricing and subscription management page.
  * Shows plans, current subscription status, upgrade/cancel options.
  *
- * Route: /billing  (add to App.jsx routes)
+ * Route: /billing  (registered in App.jsx — was previously missing entirely)
  */
 
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { billingAPI } from '../services/api';
 import './BillingPage.css';
 
 const FEATURE_ICONS = {
-  'Up to 50 invoices/month'  : '📄',
   'Up to 500 invoices/month' : '📄',
   'Up to 5,000 invoices/month': '📄',
   'Up to 10,000 invoices/month': '📄',
@@ -37,8 +37,16 @@ const FEATURE_ICONS = {
 };
 
 export default function BillingPage() {
-  const { token, user } = useAuth();
+  const { token } = useAuth();
   const navigate         = useNavigate();
+  const [searchParams]   = useSearchParams();
+
+  // BUGFIX: pricing-card buttons on the landing page now pass ?plan=starter
+  // (etc.) through signup to here, instead of that choice being silently
+  // dropped. This only highlights the matching card — it does NOT start
+  // checkout automatically. The person still clicks the button themselves,
+  // so nobody is charged or asked for a card just by landing on this page.
+  const preselectedPlan = searchParams.get('plan');
 
   const [plans, setPlans]               = useState([]);
   const [subscription, setSubscription] = useState(null);
@@ -199,35 +207,29 @@ export default function BillingPage() {
           </div>
         )}
 
+        {/* ── No active plan ── */}
+        {/* Paddle has no free tier (see paddle.service.js PLANS) — this used
+            to be represented as a fake "$0 Free plan" PricingCard, which
+            implied it was a real product tier. It isn't one; it's just the
+            default state before subscribing to anything. A plain status
+            line says the same thing honestly without the pricing-card
+            treatment. */}
+        {!isActive && (
+          <div className="billing-no-sub">
+            {preselectedPlan
+              ? `You picked the ${preselectedPlan.charAt(0).toUpperCase()}${preselectedPlan.slice(1)} plan — confirm below to start your 3-day trial.`
+              : "You don't have a paid plan yet. Pick one below when you're ready."}
+          </div>
+        )}
+
         {/* ── Pricing cards ── */}
         <div className="billing-plans-grid">
-          {/* Free tier */}
-          <PricingCard
-            plan={{
-              id         : 'free',
-              name       : 'Free',
-              price      : 0,
-              currency   : 'USD',
-              description: 'Try Auros with no commitment',
-              features   : [
-                'Up to 50 invoices/month',
-                'CSV, XLSX, XML uploads',
-                'AI reconciliation',
-                'Email support',
-              ],
-            }}
-            isCurrent={!isActive}
-            interval={billingInterval}
-            onSelect={() => navigate('/dashboard')}
-            ctaLabel="Get started free"
-            isPopular={false}
-          />
-
           {plans.filter(p => !p.isEnterprise).map(plan => (
             <PricingCard
               key={plan.id}
               plan={plan}
               isCurrent={currentPlanId === plan.id && isActive}
+              isPreselected={!isActive && preselectedPlan === plan.id}
               interval={billingInterval}
               isPopular={plan.id === 'growth'}
               loading={checkoutLoading === plan.id}
@@ -245,6 +247,7 @@ export default function BillingPage() {
               key={plan.id}
               plan={plan}
               isCurrent={currentPlanId === plan.id && isActive}
+              isPreselected={!isActive && preselectedPlan === plan.id}
               interval={billingInterval}
               isPopular={false}
               onSelect={() => handleCheckout(plan.id)}
@@ -273,15 +276,16 @@ export default function BillingPage() {
 }
 
 // ── PricingCard component ──────────────────────────────────────────────────────
-function PricingCard({ plan, isCurrent, interval, isPopular, isEnterprise, loading, onSelect, ctaLabel }) {
+function PricingCard({ plan, isCurrent, isPreselected, interval, isPopular, isEnterprise, loading, onSelect, ctaLabel }) {
   const yearlyPrice = plan.price ? Math.round(plan.price * 12 * 0.8) : null;
   const displayPrice = interval === 'year' && yearlyPrice
     ? Math.round(yearlyPrice / 12)
     : plan.price;
 
   return (
-    <div className={`billing-card ${isPopular ? 'billing-card--popular' : ''} ${isCurrent ? 'billing-card--current' : ''}`}>
+    <div className={`billing-card ${isPopular ? 'billing-card--popular' : ''} ${isCurrent ? 'billing-card--current' : ''} ${isPreselected ? 'billing-card--preselected' : ''}`}>
       {isPopular && <div className="billing-card__popular-badge">Most popular</div>}
+      {isPreselected && !isPopular && <div className="billing-card__popular-badge billing-card__popular-badge--selected">Your pick</div>}
 
       <div className="billing-card__header">
         <div className="billing-card__name">{plan.name}</div>
@@ -361,7 +365,7 @@ const FAQ_ITEMS = [
   },
   {
     q: 'What payment methods do you accept?',
-    a: 'All major credit/debit cards, PayPal, and local payment methods via Paddle.',
+    a: 'All major credit/debit cards (Visa, Mastercard, Amex) via Paddle.',
   },
   {
     q: 'Is my financial data secure?',

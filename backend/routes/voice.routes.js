@@ -39,8 +39,152 @@ const router     = express.Router();
 const multer     = require('multer');
 const { requireAuth } = require('../controllers/auth.controller');
 const hybridSvc  = require('../services/voice/hybridVoice.service');
+const approvalRules   = require('../services/procurement/approvalRules.service');
+const { ROLE_LEVELS }  = require('../middleware/rbac');
 
 const MAX_AMBIGUITIES = parseInt(process.env.MAX_AMBIGUITIES || '500', 10);
+
+// ── Rule-management commands (copilot chat, no separate UI) ──────────────────
+// command_parser.py's _detect_rule_command (already built, just never wired
+// into op_parse_command until now) recognises "auto-approve invoices under
+// $500 from now on", "list my rules", "delete the ... rule", "disable the
+// ... rule" and returns a single action of one of these 4 types instead of
+// the usual {indices, response} item actions. Node executes it here — right
+// after the parser call, before the response reaches the frontend — so
+// ProcurementCopilot.jsx's existing action-application loop (which only
+// understands {indices, response}) never sees these action types at all: by
+// the time a rule action reaches the client it's already been turned into
+// actions:[] plus a plain-English interpretation, rendered exactly like any
+// other chat reply.
+const RULE_ACTION_TYPES = new Set(['create_rule', 'list_rules', 'delete_rule', 'toggle_rule']);
+
+const _AMBIGUITY_TYPE_LABELS = {
+  amount_mismatch        : 'amount mismatches',
+  quantity_mismatch      : 'quantity mismatches',
+  contract_price_variance: 'contract price variances',
+  tax_discrepancy        : 'tax discrepancies',
+  no_po_match             : 'invoices with no matching PO',
+};
+
+function _describeAppliesTo(appliesTo) {
+  return appliesTo.map(t => _AMBIGUITY_TYPE_LABELS[t] || t).join(', ');
+}
+
+function _formatRuleLine(rule) {
+  const c = rule.condition;
+  const desc =
+    c.type === 'amount_under'       ? `amount under $${Number(c.value).toLocaleString()}` :
+    c.type === 'variance_under_pct' ? `variance under ${c.value}%` :
+    c.type === 'vendor_in'          ? `vendor is ${c.value.join(' / ')}` :
+    c.type;
+  return `${rule.enabled ? '\u25cf' : '\u25cb (disabled)'} "${rule.name}" \u2014 auto-approve when ${desc}`;
+}
+
+// Fuzzy-match a spoken/typed rule reference ("the amount 500 rule") against
+// the user's actual saved rule names. Deliberately conservative — these are
+// financial controls, so this only acts on a clear, unambiguous best match;
+// anything else surfaces the current rule list and asks rather than guesses.
+function _resolveRuleReference(reference, rules) {
+  const ref = (reference || '').toLowerCase().trim();
+  const refTokens = ref.split(/\s+/).filter(Boolean);
+  if (refTokens.length === 0 || rules.length === 0) return null;
+
+  const scored = rules
+    .map(rule => {
+      const name = rule.name.toLowerCase();
+      let score = 0;
+      if (name === ref) score += 100;
+      else if (name.includes(ref) || ref.includes(name)) score += 50;
+      for (const tok of refTokens) if (tok.length >= 2 && name.includes(tok)) score += 1;
+      return { rule, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const [best, second] = scored;
+  if (best && best.score > 0 && (!second || best.score > second.score)) return best.rule;
+  return null;
+}
+
+async function _resolveRuleAction(result, user) {
+  const first = (result.actions || [])[0];
+  if (!first || !RULE_ACTION_TYPES.has(first.action)) return result;
+
+  // list_rules is read-only — any authenticated role can see what's
+  // configured. create/delete/toggle mutate a financial control and are
+  // gated exactly like requireFinance on the REST /api/procurement/rules
+  // routes — the chat surface must not be a way around that gate.
+  const isMutating = first.action !== 'list_rules';
+  if (isMutating && (ROLE_LEVELS[user?.role] || 0) < ROLE_LEVELS.finance) {
+    return {
+      ...result,
+      actions: [],
+      interpretation: `Managing approval rules requires the finance role. Your role: ${user?.role || 'unknown'}.`,
+      warning: 'INSUFFICIENT_ROLE',
+    };
+  }
+
+  try {
+    if (first.action === 'list_rules') {
+      const rules = await approvalRules.listRules();
+      const interpretation = rules.length === 0
+        ? 'You don\u2019t have any approval rules yet. Try "auto-approve invoices under $500" to create one.'
+        : `Your approval rules:\n${rules.map(_formatRuleLine).join('\n')}`;
+      return { ...result, actions: [], interpretation };
+    }
+
+    if (first.action === 'create_rule') {
+      const parsed = first.condition || {};
+      // command_parser.py's field names (threshold / vendors) differ from
+      // approvalRules.service.js's storage shape (value) — bridged here.
+      const value = parsed.type === 'vendor_in' ? (parsed.vendors || []) : parsed.threshold;
+      if (parsed.type === 'vendor_in' && value.length === 0) {
+        return { ...result, actions: [], interpretation: 'Couldn\u2019t tell which vendor you meant. Try naming it directly, e.g. "auto-approve invoices from Acme Corp".' };
+      }
+      const condition = { type: parsed.type, value };
+      // The spoken command doesn't name which ambiguity types it should
+      // cover, so this defaults to everything approvalRules.service.js
+      // allows for that condition type (its own ALLOWED_TARGETS — the same
+      // source of truth the REST API would validate against). The
+      // confirmation spells this out so nothing is applied silently.
+      const appliesTo = approvalRules.ALLOWED_TARGETS[condition.type] || [];
+      if (appliesTo.length === 0) {
+        return { ...result, actions: [], interpretation: `Couldn\u2019t determine what "${first.ruleName}" should apply to.` };
+      }
+
+      const rule = await approvalRules.createRule({ name: first.ruleName, condition, appliesTo, createdBy: user.id });
+      return {
+        ...result,
+        actions: [],
+        interpretation:
+          `Created rule "${rule.name}". It applies to: ${_describeAppliesTo(appliesTo)}. ` +
+          `This only affects future reconciliation jobs, not items already pending. ` +
+          `Say "list my rules" anytime to review, or "delete the ${rule.name} rule" to remove it.`,
+      };
+    }
+
+    // delete_rule / toggle_rule share the same reference-resolution step.
+    const rules = await approvalRules.listRules();
+    const match = _resolveRuleReference(first.ruleReference, rules);
+
+    if (!match) {
+      const listing = rules.length
+        ? `Your current rules:\n${rules.map(_formatRuleLine).join('\n')}\n\nWhich one did you mean?`
+        : 'You don\u2019t have any approval rules yet.';
+      return { ...result, actions: [], interpretation: `I couldn\u2019t tell which rule you meant. ${listing}` };
+    }
+
+    if (first.action === 'delete_rule') {
+      await approvalRules.deleteRule(match.id);
+      return { ...result, actions: [], interpretation: `Deleted rule "${match.name}".` };
+    }
+
+    const updated = await approvalRules.updateRule(match.id, { enabled: first.enable });
+    return { ...result, actions: [], interpretation: `${updated.enabled ? 'Enabled' : 'Disabled'} rule "${updated.name}".` };
+
+  } catch (err) {
+    return { ...result, actions: [], interpretation: `Couldn\u2019t complete that: ${err.message}` };
+  }
+}
 
 // ── FIX 2: Rate limiting (graceful if package not installed) ─────────────────
 let audioRateLimit   = null;
@@ -164,13 +308,14 @@ router.post('/command', requireAuth, ...withAudioLimit, upload.single('audio'), 
     const pendingId   = req.body.pendingId || null;
     const commandId   = _getCommandId(req);  // FIX 4
 
-    const result = await hybridSvc.processVoiceCommand(
+    let result = await hybridSvc.processVoiceCommand(
       req.file.buffer,
       req.file.mimetype,
       ambiguities,
       pendingId,    // FIX 1
       commandId     // FIX 4
     );
+    result = await _resolveRuleAction(result, req.user);
 
     if (result.transcriptionError) {
       return res.json({
@@ -228,7 +373,8 @@ router.post('/text-command', requireAuth, ...withCommandLimit, async (req, res, 
       return res.status(400).json({ error: 'text field is required', code: 'MISSING_TEXT' });
     }
 
-    const result = await hybridSvc.processTextCommand(text.trim(), ambiguities, pendingId);
+    let result = await hybridSvc.processTextCommand(text.trim(), ambiguities, pendingId);
+    result = await _resolveRuleAction(result, req.user);
 
     res.json({
       ok            : true,

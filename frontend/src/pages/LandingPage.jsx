@@ -94,7 +94,7 @@ export default function LandingPage() {
           </div>
           <div className="lp-nav__actions">
             <button className="lp-btn-ghost" onClick={() => navigate('/login')}>Log in</button>
-            <button className="lp-btn-primary" onClick={() => navigate('/signup')}>Start free</button>
+            <button className="lp-btn-primary" onClick={() => navigate('/signup')}>Start free trial</button>
           </div>
           <button className="lp-nav__hamburger" onClick={() => setMenuOpen(o => !o)}>
             <span /><span /><span />
@@ -105,7 +105,7 @@ export default function LandingPage() {
             <a href="#features" onClick={() => setMenuOpen(false)}>Features</a>
             <a href="#how"      onClick={() => setMenuOpen(false)}>How it works</a>
             <a href="#pricing"  onClick={() => setMenuOpen(false)}>Pricing</a>
-            <button className="lp-btn-primary" onClick={() => navigate('/signup')}>Start free</button>
+            <button className="lp-btn-primary" onClick={() => navigate('/signup')}>Start free trial</button>
           </div>
         )}
       </nav>
@@ -125,7 +125,7 @@ export default function LandingPage() {
           </p>
           <div className="lp-hero__actions">
             <button className="lp-btn-primary lp-btn-lg" onClick={() => navigate('/signup')}>
-              Start free — no credit card
+              Start your free trial — no credit card
             </button>
             <a href="#how" className="lp-btn-ghost lp-btn-lg">See how it works</a>
           </div>
@@ -270,7 +270,7 @@ export default function LandingPage() {
                 <li>Voice commands</li>
                 <li>Email support</li>
               </ul>
-              <button className="lp-btn-outline lp-pricing-card__btn" onClick={() => navigate('/signup')}>
+              <button className="lp-btn-outline lp-pricing-card__btn" onClick={() => navigate('/signup?plan=starter')}>
                 Start Starter free for 3 days
               </button>
               <p className="lp-pricing-card__note">Card required, not charged until the trial ends</p>
@@ -287,7 +287,7 @@ export default function LandingPage() {
                 <li>Audit trails</li>
                 <li>Priority support</li>
               </ul>
-              <button className="lp-btn-primary lp-pricing-card__btn" onClick={() => navigate('/signup')}>
+              <button className="lp-btn-primary lp-pricing-card__btn" onClick={() => navigate('/signup?plan=growth')}>
                 Start Growth free for 3 days
               </button>
               <p className="lp-pricing-card__note">Card required, not charged until the trial ends</p>
@@ -304,7 +304,7 @@ export default function LandingPage() {
                 <li>SLA guarantee</li>
                 <li>On-premise option</li>
               </ul>
-              <button className="lp-btn-outline lp-pricing-card__btn" onClick={() => navigate('/signup')}>
+              <button className="lp-btn-outline lp-pricing-card__btn" onClick={() => window.open('mailto:hello@auros.app?subject=Enterprise Plan Enquiry', '_blank')}>
                 Contact us
               </button>
             </div>
@@ -318,10 +318,10 @@ export default function LandingPage() {
         <div className="lp-container">
           <h2 className="lp-cta__title">Your data decisions deserve a paper trail.</h2>
           <p className="lp-cta__sub">
-            Start free. No credit card. First cleanup or reconciliation in under 5 minutes.
+            Start your free trial. No credit card. First cleanup or reconciliation in under 5 minutes.
           </p>
           <button className="lp-btn-primary lp-btn-lg" onClick={() => navigate('/signup')}>
-            Get started free →
+            Start free trial →
           </button>
         </div>
       </section>
